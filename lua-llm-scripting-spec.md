@@ -1,4 +1,4 @@
-﻿# ValidusBot Lua Scripting Spec for LLMs
+# ValidusBot Lua Scripting Spec for LLMs
 
 ## Purpose
 This document is a single-source reference for generating Lua scripts for ValidusBot.
