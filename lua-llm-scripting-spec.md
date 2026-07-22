@@ -51,7 +51,7 @@ This file includes a curated behavior guide plus an auto-generated public API ap
 - Compatibility aliases are not part of the supported script-writing surface; generated scripts must use the exact names documented in this file.
 
 ## Known Constraints
-- Hotkeys: alt modifier is not supported by current Events.RegisterKeyEvent API.
+- Hotkeys: alt cannot be used with Events.RegisterKeyEvent/Hotkeys.RegisterCombo, but it is supported by Hotkeys.SendCombo.
 - Standard Lua `table.concat` is allowed in sandboxed user scripts and can be used for safe string assembly.
 - Extended keys: insert/delete/home/end/pageup/pagedown/arrows default to extended=true in Hotkeys.ParseCombo.
 - Features API excludes Objects Dumper from public get/set/list/status paths.
@@ -259,6 +259,17 @@ Combo parser and event registration wrapper.
 Primary API:
 - Hotkeys.ParseCombo(combination)
 - Hotkeys.RegisterCombo(params)
+- Hotkeys.SendKey(key, clientOnly?)
+- Hotkeys.SendCombo(combination, clientOnly?)
+
+`SendKey` and `SendCombo` always queue a key-down/key-up sequence for the current injected Tibia client window. `clientOnly` defaults to `true`, which bypasses ImGui, Lua callback hotkeys, and ValidusBot feature hotkeys. Pass `false` only when the synthetic input should travel through the normal client window procedure. A `true` return means the sequence was queued, not that Tibia had an action assigned to it. No arbitrary window handles or system-wide input are exposed.
+
+```lua
+Hotkeys.SendKey("f1")
+Hotkeys.SendCombo("ctrl+shift+f9")
+Hotkeys.SendCombo("alt+f1")
+Hotkeys.SendCombo("ctrl+f1", false) -- opt into normal ImGui/bot/Lua routing
+```
 
 Expected params for RegisterCombo:
 - id: string (required)
@@ -370,6 +381,7 @@ Common state:
 - Self.GetHealth / GetMaxHealth / GetHealthPercentage
 - Self.GetMana / GetMaxMana / GetManaPercentage
 - Self.GetCapacity / GetStamina
+- Self.GetItemCount(itemId, tierLevel?)
 - Self.GetCharacterWorld(characterName)
 - Self.GetLevel / GetSoul / GetLevelPercentage
 - Self.IsOnline / IsAlive / IsAttacking / IsFollowing
@@ -442,6 +454,8 @@ Tile checks may return nil when minimap data is unavailable. `FindPath` returns 
 Item use and trade wrappers.
 
 Primary API:
+- Item.Use(itemId)
+- Item.UseOnSelf(itemId)
 - Item.UseOnCreature(itemId, creatureId)
 - Item.Buy(itemId, itemCount, ignoreCapacity, buyInShoppingBags)
 - Item.Sell(itemId, itemCount, sellEquipped)
@@ -802,21 +816,68 @@ Core classes:
 - WorldBox
 - WorldImage
 
-All classes support `New`, `Create`, `Remove`, `SetEnabled`, `SetZIndex`, `SetParent`, `ClearParent`, `IsCreated`, `GetEnabled`, `GetVisible`, `GetPosition`, `GetWidth`, and `GetHeight` as applicable. Setters return the same object for chaining.
+All classes support `New`, `Create`, `Remove`, `SetEnabled`, `SetZIndex`, `SetRenderLayer`, `SetParent`, `ClearParent`, `IsCreated`, `GetEnabled`, `GetVisible`, `GetPosition`, `GetWidth`, and `GetHeight` as applicable. Setters return the same object for chaining.
 
 Class-specific methods:
-- ScreenText: SetText, SetColor, SetAlignment, SetDraggable, SetDragTarget, SetOnDragEnd, SetClickable, SetScreenPosition, GetText, GetColor
-- ScreenImage: SetSource, SetItemId, SetItemName, SetSize, SetLabel, SetAlignment, SetDraggable, SetDragTarget, SetOnDragEnd, SetClickable, SetScreenPosition
-- WorldText: SetText, SetColor, SetPosition, SetLifetime, SetOffset, GetText, GetColor
+- ScreenText: SetText, SetColor, SetFont, SetFontFamily, SetFontSize, SetAlignment, SetDraggable, SetDragTarget, SetOnDragEnd, SetClickable, SetScreenPosition, GetText, GetColor
+- ScreenImage: SetSource, SetSourceBase64, SetSourceBytes, SetItemId, SetItemName, SetSize, SetLabel, SetAlignment, SetDraggable, SetDragTarget, SetOnDragEnd, SetClickable, SetScreenPosition
+- WorldText: SetText, SetColor, SetFont, SetFontFamily, SetFontSize, SetPosition, SetLifetime, SetOffset, GetText, GetColor
 - WorldBox: SetSize, SetWidth, SetHeight, SetColor, SetBorderWidth, SetBorderColor, SetPosition, SetLifetime, GetColor
-- WorldImage: SetSource, SetItemId, SetItemName, SetSize, SetPosition, SetOffset, SetLifetime
+- WorldImage: SetSource, SetSourceBase64, SetSourceBytes, SetItemId, SetItemName, SetSize, SetLabel, SetPosition, SetOffset, SetLifetime
 
 Use HUD objects for visual diagnostics, status displays, labels, and map markers. IDs should be stable and unique within the script.
+
+Render-layer notes:
+- Every HUD element uses `HUDRenderLayer.MAP` by default, preserving the established game-view parent and clipping behavior.
+- Pass `HUDRenderLayer.OVERLAY` as the final `New(...)` argument or call `SetRenderLayer(HUDRenderLayer.OVERLAY)` before `Create()` to draw over Tibia panels outside the map rectangle.
+- A literal null Qt parent is not exposed because an unparented `QQuickItem` normally leaves the visual scene. The overlay layer safely uses the highest available item in Tibia's existing Qt scene.
+- `SetRenderLayer` is creation-only. Choose the layer before `Create()`; changing it afterward raises a Lua error.
+- `SetZIndex` still orders elements within their selected layer. Overlay elements receive an internal scene-layer bias so they remain above normal client QQuick items.
+- `SetParent` and `ClearParent` are separate logical HUD relationships; they control visibility/removal/movement cascades and do not select the Qt render layer. Logical parents and children must use the same render layer.
+
+```lua
+local overlayTitle = ScreenText:New("overlay_title", HUDRenderLayer.OVERLAY)
+    :SetText("Drawn above Tibia panels")
+    :SetFont("Segoe UI", 20)
+    :SetScreenPosition(700, 120)
+    :SetZIndex(10)
+    :Create()
+
+-- Equivalent builder form:
+local overlayIcon = ScreenImage:New("overlay_icon")
+    :SetRenderLayer(HUDRenderLayer.OVERLAY)
+    :SetSourceBase64(MY_PNG_BASE64)
+    :SetSize(32, 32)
+    :SetScreenPosition(760, 120)
+    :Create()
+```
 
 Screen image notes:
 - ScreenImage:SetLabel(text, color, offsetX, offsetY) attaches or updates text on the image.
 - ScreenImage:SetScreenPosition(x, y) positions image HUD elements in screen pixels.
 - ScreenImage:SetParent(parent_id) can parent icons to a draggable ScreenText handle; children keep their current offset when the parent moves.
+- ScreenImage:SetSourceBase64(base64Png) and WorldImage:SetSourceBase64(base64Png) embed PNG data directly in the script. Raw Base64 and `data:image/png;base64,...` values are accepted.
+- ScreenImage:SetSourceBytes(pngBytes) and WorldImage:SetSourceBytes(pngBytes) accept a contiguous Lua array of integer bytes, including hexadecimal literals such as `{0x89, 0x50, 0x4E, 0x47, ...}`.
+- Embedded sources are PNG-only. Encoded data is limited to 4 MiB and decoded dimensions to 2048x2048. Choose exactly one source setter per image; calling another source setter replaces the prior selection.
+
+Text font notes:
+- `ScreenText` and `WorldText` use Tibia's HUD font and size by default.
+- `SetFont(family, pixelSize)` selects an installed system-font family and a pixel size from 1 to 256. It works both before and after `Create()`.
+- `SetFontFamily(family)` and `SetFontSize(pixelSize)` update one property while preserving the other.
+- Pass `nil` for a property to inherit that property from Tibia again; `SetFont(nil, nil)` fully resets the element.
+- A missing system font may be replaced by a platform fallback, so scripts should prefer common Windows font-family names.
+
+```lua
+local title = ScreenText:New("status_title")
+    :SetText("Validus status")
+    :SetFont("Segoe UI", 20)
+    :SetScreenPosition(120, 80)
+    :Create()
+
+title:SetFontSize(26)       -- runtime resize
+title:SetFontFamily("Arial") -- runtime family change
+title:SetFont(nil, nil)     -- restore Tibia font and size
+```
 
 ### lua_consts.lua
 Shared gameplay constants/enums for movement, pathfinding, effects, equipment, chat, creature state, combat modes, skills, VIP flags, vocation, and walker events.
@@ -1734,6 +1795,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.HUD.UpdateBorderColor(id: string, color: table) -> nil`
 - `Engine.HUD.UpdateBorderWidth(id: string, border_width: number) -> nil`
 - `Engine.HUD.UpdateColor(id: string, color: table) -> nil`
+- `Engine.HUD.UpdateFont(id: string, fontFamily: string|nil, fontSize: integer|nil) -> nil`
 - `Engine.HUD.UpdateHeight(id: string, height: number) -> nil`
 - `Engine.HUD.UpdateImageLabel(params: table) -> nil`
 - `Engine.HUD.UpdateLifetime(id: string, lifetime_ms: integer) -> nil`
@@ -2058,6 +2120,8 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 ### hotkeys.lua
 - `Hotkeys.ParseCombo(combination: string) -> table|nil, string|nil`
 - `Hotkeys.RegisterCombo(params: table) -> boolean`
+- `Hotkeys.SendCombo(combination: string, clientOnly?: boolean) -> boolean`
+- `Hotkeys.SendKey(key: string|integer, clientOnly?: boolean) -> boolean`
 
 ### http.lua
 - `Http.Get(url: string, options?: table) -> table`
@@ -2075,7 +2139,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ScreenImage:GetVisible() -> boolean`
 - `ScreenImage:GetWidth() -> number`
 - `ScreenImage:IsCreated() -> boolean`
-- `ScreenImage:New(id)`
+- `ScreenImage:New(id, renderLayer?: string)`
 - `ScreenImage:Remove()`
 - `ScreenImage:SetAlignment(h_align, v_align)`
 - `ScreenImage:SetClickable(callback)`
@@ -2087,9 +2151,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ScreenImage:SetLabel(text, color, offsetX, offsetY)`
 - `ScreenImage:SetOnDragEnd(callback: function|nil) -> ScreenImage`
 - `ScreenImage:SetParent(parent: ScreenText|ScreenImage|string) -> ScreenImage`
+- `ScreenImage:SetRenderLayer(renderLayer: string) -> ScreenImage`
 - `ScreenImage:SetScreenPosition(x: number, y: number) -> ScreenImage`
 - `ScreenImage:SetSize(width, height)`
 - `ScreenImage:SetSource(path)`
+- `ScreenImage:SetSourceBase64(base64Png: string) -> ScreenImage`
+- `ScreenImage:SetSourceBytes(pngBytes: number[]) -> ScreenImage`
 - `ScreenImage:SetZIndex(zIndex)`
 - `ScreenText:ClearParent() -> ScreenText`
 - `ScreenText:Create() -> ScreenText`
@@ -2101,7 +2168,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ScreenText:GetVisible() -> boolean`
 - `ScreenText:GetWidth() -> number`
 - `ScreenText:IsCreated() -> boolean`
-- `ScreenText:New(id: string) -> ScreenText`
+- `ScreenText:New(id: string, renderLayer?: string) -> ScreenText`
 - `ScreenText:Remove()`
 - `ScreenText:SetAlignment(h_align: number, v_align: number) -> ScreenText`
 - `ScreenText:SetClickable(callback: function) -> ScreenText`
@@ -2109,8 +2176,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ScreenText:SetDraggable(draggable: boolean) -> ScreenText`
 - `ScreenText:SetDragTarget(target: ScreenText|ScreenImage|string|nil) -> ScreenText`
 - `ScreenText:SetEnabled(enabled: boolean) -> ScreenText`
+- `ScreenText:SetFont(family: string|nil, pixelSize: integer|nil) -> ScreenText`
+- `ScreenText:SetFontFamily(family: string|nil) -> ScreenText`
+- `ScreenText:SetFontSize(pixelSize: integer|nil) -> ScreenText`
 - `ScreenText:SetOnDragEnd(callback: function|nil) -> ScreenText`
 - `ScreenText:SetParent(parent: ScreenText|ScreenImage|string) -> ScreenText`
+- `ScreenText:SetRenderLayer(renderLayer: string) -> ScreenText`
 - `ScreenText:SetScreenPosition(x: number, y: number) -> ScreenText`
 - `ScreenText:SetText(text: string) -> ScreenText`
 - `ScreenText:SetZIndex(zIndex: number) -> ScreenText`
@@ -2123,7 +2194,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WorldBox:GetVisible() -> boolean`
 - `WorldBox:GetWidth() -> number`
 - `WorldBox:IsCreated() -> boolean`
-- `WorldBox:New(id: string, x: number, y: number, z: number) -> WorldBox`
+- `WorldBox:New(id: string, x: number, y: number, z: number, renderLayer?: string) -> WorldBox`
 - `WorldBox:Remove()`
 - `WorldBox:SetBorderColor(border_color: table) -> WorldBox`
 - `WorldBox:SetBorderWidth(border_width: number) -> WorldBox`
@@ -2133,6 +2204,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WorldBox:SetLifetime(lifetime_ms: number) -> WorldBox`
 - `WorldBox:SetParent(parent_id: string) -> WorldBox`
 - `WorldBox:SetPosition(x: number, y: number, z: number) -> WorldBox`
+- `WorldBox:SetRenderLayer(renderLayer: string) -> WorldBox`
 - `WorldBox:SetSize(width: number, height: number) -> WorldBox`
 - `WorldBox:SetWidth(width: number) -> WorldBox`
 - `WorldBox:SetZIndex(zIndex: number) -> WorldBox`
@@ -2144,17 +2216,21 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WorldImage:GetVisible() -> boolean`
 - `WorldImage:GetWidth() -> number`
 - `WorldImage:IsCreated() -> boolean`
-- `WorldImage:New(id, x, y, z)`
+- `WorldImage:New(id, x, y, z, renderLayer?: string)`
 - `WorldImage:Remove()`
 - `WorldImage:SetEnabled(enabled: boolean) -> WorldImage`
 - `WorldImage:SetItemId(itemId)`
 - `WorldImage:SetItemName(itemName)`
+- `WorldImage:SetLabel(text: string|nil, color?: table, offsetX?: number, offsetY?: number) -> WorldImage`
 - `WorldImage:SetLifetime(lifetimeMs)`
 - `WorldImage:SetOffset(offsetX, offsetY)`
 - `WorldImage:SetParent(parent_id: string) -> WorldImage`
 - `WorldImage:SetPosition(x, y, z)`
+- `WorldImage:SetRenderLayer(renderLayer: string) -> WorldImage`
 - `WorldImage:SetSize(width, height)`
 - `WorldImage:SetSource(path)`
+- `WorldImage:SetSourceBase64(base64Png: string) -> WorldImage`
+- `WorldImage:SetSourceBytes(pngBytes: number[]) -> WorldImage`
 - `WorldImage:SetZIndex(zIndex)`
 - `WorldText:ClearParent() -> WorldText`
 - `WorldText:Create() -> WorldText`
@@ -2166,14 +2242,18 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WorldText:GetVisible() -> boolean`
 - `WorldText:GetWidth() -> number`
 - `WorldText:IsCreated() -> boolean`
-- `WorldText:New(id: string, x: number, y: number, z: number) -> WorldText`
+- `WorldText:New(id: string, x: number, y: number, z: number, renderLayer?: string) -> WorldText`
 - `WorldText:Remove()`
 - `WorldText:SetColor(color: table) -> WorldText`
 - `WorldText:SetEnabled(enabled: boolean) -> WorldText`
+- `WorldText:SetFont(family: string|nil, pixelSize: integer|nil) -> WorldText`
+- `WorldText:SetFontFamily(family: string|nil) -> WorldText`
+- `WorldText:SetFontSize(pixelSize: integer|nil) -> WorldText`
 - `WorldText:SetLifetime(lifetime_ms: number) -> WorldText|WorldBox`
 - `WorldText:SetOffset(offset_x: number, offset_y: number) -> WorldText|WorldBox`
 - `WorldText:SetParent(parent_id: string) -> WorldText`
 - `WorldText:SetPosition(x: number, y: number, z: number) -> WorldText`
+- `WorldText:SetRenderLayer(renderLayer: string) -> WorldText`
 - `WorldText:SetText(text: string) -> WorldText`
 - `WorldText:SetZIndex(zIndex: number) -> WorldText`
 
@@ -2210,10 +2290,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Item.IsTakable(itemId)`
 - `Item.IsUsable(itemId)`
 - `Item.Sell(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> any`
+- `Item.Use(itemId: integer) -> boolean`
 - `Item.UseFromContainerOnFloor(floorPosition: table, fromItemId: integer, toItemId: integer, toStackPosition: integer) -> any`
 - `Item.UseFromContainerToContainer(fromContainer: integer, fromSlot: integer, fromItemId: integer, toContainer: integer, toSlot: integer, toItemId: integer) -> any`
 - `Item.UseFromFloorToContainer(floorPosition: table, fromItemId: integer, fromStackPosition: integer, toItemId: integer) -> any`
-- `Item.UseOnCreature(itemId: integer, creatureId: integer) -> any`
+- `Item.UseOnCreature(itemId: integer, creatureId: integer) -> boolean`
+- `Item.UseOnSelf(itemId: integer) -> boolean`
 
 ### json.lua
 - Constant: `Json.Null` (JSON null sentinel)
@@ -2525,6 +2607,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.GetFollowId() -> integer|nil`
 - `Self.GetHealth() -> integer|nil`
 - `Self.GetHealthPercentage() -> number|nil`
+- `Self.GetItemCount(itemId: integer, tierLevel?: integer) -> integer`
 - `Self.GetLevel() -> integer|nil`
 - `Self.GetLevelPercentage() -> number|nil`
 - `Self.GetMana() -> integer|nil`
@@ -2677,3 +2760,4 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WebSocketConnection:IsOpen() -> boolean`
 - `WebSocketConnection:Receive(timeoutMs?: integer) -> table`
 - `WebSocketConnection:Send(data: string, binary?: boolean) -> boolean, string|nil`
+
