@@ -23,26 +23,108 @@ For highest accuracy:
 This file includes a curated behavior guide plus an auto-generated public API appendix derived from `docs/Scripts/core`. The appendix lists canonical function names, parameter types where annotated, and return types while deliberately omitting local helpers, compatibility aliases, raw bindings, protocol details, and bootstrap internals.
 
 ## Runtime Model
-- Scripts run inside the bot Lua runtime and use supported APIs exposed as global tables.
-- Core helper libraries are loaded from Scripts/core.
-- User script public API uses canonical PascalCase module access (for example Self, Map, Container, Module, ChatChannelStorage, VIP).
-- Low-level runtime globals are unsupported unless explicitly documented in this file.
-- Script execution is cooperative. Long loops must yield (for example via wait(...)).
-- Some APIs may return nil when game state or a required capability is unavailable.
+
+- Lua runs cooperatively on the bot/game thread. Managed coroutines provide
+  yielding and fairness; they are not background OS threads. Game reads/actions,
+  script callbacks, and Lua state access therefore remain serialized.
+- The runtime loads `Scripts/core` before the user file. Generated scripts should
+  use the canonical PascalCase globals from this document, such as `Self`,
+  `Creature`, `Map`, `Cavebot`, `Module`, `Storage`, and `Engine`.
+- With the sandbox enabled, each user file and required user module has a private
+  `_ENV`. `_G` points to that private environment. Supported native/core globals
+  are available through a restricted fallback, but user assignments do not
+  modify the shared core environment.
+- The top-level script body is a managed coroutine. After it finishes, the
+  runtime resolves and starts `init()` from the same private `_ENV`, if present.
+  `init()` is also managed and may call `wait`, HTTP, or WebSocket APIs.
+- `Module` callbacks, scheduled callbacks, and registered event callbacks run as
+  managed coroutines. Long or repeated work must yield with `wait(ms)` or return
+  promptly and be scheduled again.
+- `terminate()` is different: it is protected synchronous cleanup, cannot yield,
+  has a 50 ms execution limit, and runs at most once. Do not start HTTP,
+  WebSocket, scheduled, or module work from it.
+- A normal script remains alive while it owns runnable/sleeping coroutines,
+  registered callbacks, scheduled events, HUD elements, or WebSockets. A script
+  with no remaining work/resources finishes automatically.
+
+### Failure isolation and diagnostics
+
+- `pcall` and `xpcall` retain normal Lua behavior. An expected error caught by
+  the script does not count as an uncaught runtime failure.
+- An uncaught top-level-body or `init()` error stops only that script.
+- An uncaught repeating-module error stops that module. If another healthy
+  repeating module exists, it keeps running; if the failed module was the
+  script's only module, the runtime stops the script.
+- An uncaught `Events.Schedule` error ends only that one-shot callback.
+- A key, packet, or Walker event registration is disabled after exactly three
+  consecutive uncaught callback failures. One successful completion resets that
+  registration's failure counter.
+- A Walker interceptor always releases its owned pause before callback failure
+  policy is applied, so a broken script cannot leave Walker indefinitely held.
+- Supported C++ exceptions from native bindings become contextual Lua errors and
+  follow the same component policy. An ordinary C++ exception escaping a script
+  tick quarantines that script and does not prevent later scripts from ticking.
+  A native access violation is the exceptional emergency case: Lua execution is
+  disabled for the client session, Walker ownership is released, and a dump is
+  written because continuing through corrupted native state is unsafe.
+- Uncaught diagnostics include script, component kind/name, callback source,
+  source line, safe error value, traceback, `failure_scope`, `runtime_action`,
+  and `policy_reason`. Complete output is written to the per-script log even
+  when UI notifications for identical errors are rate-limited.
+- Error values may be strings, numbers, tables, userdata, threads, `nil`, or
+  values with hostile `__tostring` metamethods. Runtime diagnostics serialize
+  them without invoking user metamethods.
+
+Do not wrap an entire repeating module in `pcall` merely to print and continue.
+That converts a genuine component failure into an apparent success and prevents
+the runtime from stopping the broken module. Catch only errors that the script
+can handle meaningfully, then either recover or rethrow with context.
+
+### Ownership, cleanup, and budgets
+
+- Key/packet/Walker events, scheduled events, HUD elements/callbacks, HTTP
+  results, WebSockets, sounds, and Walker holds are owned by the creating script.
+  Teardown removes or cancels only that owner's resources.
+- Explicit cleanup in `terminate()` is useful for restoring feature settings the
+  script deliberately changed, but native owner-scoped resources are also
+  released automatically.
+- Per script: 64 MiB Lua memory, 256 managed coroutines, 64 pending event
+  callbacks, and 32 outstanding async result tokens.
+- Scheduler limits are 3 ms per coroutine resume, 4 ms per script per frame, and
+  8 ms for all Lua work per frame. Yieldable Lua is time-sliced. A single
+  unpreemptable 50 ms overrun, or three consecutive smaller unpreemptable budget
+  overruns, circuit-breaks the offending component.
+- Delays are integer milliseconds from 0 through 86,400,000 unless a narrower
+  function-specific range is documented.
 
 ## Hard Rules for Generated Scripts
-1. Do not use os.execute. Use os.exit only for an explicit emergency client-shutdown policy (for example, preventing a red-skull equipment loss); it terminates the entire game client and is audit-logged.
-2. Never disable or query the reserved Objects Dumper feature through Features API.
-3. Avoid busy loops. Any repeating logic must yield with wait(ms) or use Module helpers (Module.Every / Module.After).
-4. Validate all external input and table fields before use.
-5. Assume runtime values can be nil and handle fallbacks safely.
-6. Use only documented PascalCase core wrappers in Scripts/core (Self.*, Map.*, Module.*, etc.).
-7. Avoid hard crashes: use guards, type checks, and pcall where appropriate.
-8. Keep scripts idempotent when possible (safe to re-run).
-9. Use explicit comments for non-obvious logic.
-10. Keep feature toggling scoped to user features only.
-11. Do not use removed compatibility aliases such as self.*, map.*, engine.ammoRefill.*, CaveBot, or _G.position.
-12. Do not call low-level runtime globals directly unless they are documented here as public API; prefer core wrappers such as Self, Creature, Creatures, Cavebot, Engine, Game, and Module.
+
+1. Use only functions and constants explicitly documented here. Never invent a
+   plausible API name; treat an absent function as unavailable.
+2. Use canonical PascalCase modules. Do not generate lower-camel compatibility
+   calls such as `self.*`, `map.*`, `CaveBot`, `_G.position`, or old
+   `engine.ammoRefill.*` paths.
+3. Do not busy-loop. Repeating work must use `Module.Every`, `Events.Schedule`,
+   or a loop that calls `wait(ms)`.
+4. Do not use `os.execute`, `os.getenv`, or `os.tmpname`. `os.exit()` is reserved
+   for an explicit emergency full-client shutdown policy and is audit-logged.
+5. Never expose, query, or toggle the reserved Objects Dumper feature through
+   `Features`/`Engine.Features`.
+6. Validate external input and option-table fields. Treat game-derived objects,
+   capabilities, and snapshots as potentially `nil` or stale.
+7. Use `pcall` only around an operation whose failure has a defined local
+   recovery path. Let unexpected module/event errors reach the runtime policy.
+8. Getter tables from `Engine` are detached snapshots. Mutating them does
+   nothing; use the matching validated setter.
+9. Keep feature changes idempotent. Prefer `Features.SetActive/Enable/Disable`
+   over assuming the previous state and toggling blindly.
+10. Use `Time.MonotonicMs()` for elapsed time. Never use `os.clock()` for
+    wall-time timeouts.
+11. Keep callbacks short, use stable owner-local IDs, and avoid high-frequency
+    allocation or full-creature scans when a smaller query suffices.
+12. If the script changes persistent bot configuration, state whether the
+    change should remain after the script stops and restore it in `terminate()`
+    when appropriate.
 
 ## Public Module Naming
 - Module tables are exposed for user scripts in PascalCase form.
@@ -51,13 +133,30 @@ This file includes a curated behavior guide plus an auto-generated public API ap
 - Compatibility aliases are not part of the supported script-writing surface; generated scripts must use the exact names documented in this file.
 
 ## Known Constraints
+
 - Hotkeys: alt cannot be used with Events.RegisterKeyEvent/Hotkeys.RegisterCombo, but it is supported by Hotkeys.SendCombo.
 - Standard Lua `table.concat` is allowed in sandboxed user scripts and can be used for safe string assembly.
 - Extended keys: insert/delete/home/end/pageup/pagedown/arrows default to extended=true in Hotkeys.ParseCombo.
 - Features API excludes Objects Dumper from public get/set/list/status paths.
 - HTTP and WebSocket operations must be started from a managed script coroutine. They yield cooperatively while waiting.
 - HTTP has no callback lifecycle API. WebSockets use explicit `Receive`; there are no `onOpen`, `onClose`, `onError`, `onRedirect`, or automatic reconnect callbacks.
+- Use `Time.MonotonicMs()` for elapsed time, retry backoff, timeouts, and
+  telemetry cadence. It advances while the process is idle and is unaffected by
+  system wall-clock changes. Its epoch is unspecified, so compare two returned
+  values. Do not use `os.clock()` for elapsed time; Lua defines it as process CPU
+  time.
 - Capability wrappers such as Inventory and NPC trade can return nil/false when the corresponding game state is unavailable. Check `IsAvailable`/capability methods where provided.
+- Sandboxed `io.open`, `os.remove`, and `os.rename` resolve inside the current
+  product's user `Scripts` directory and cannot access `Scripts/core`.
+  Individual file reads/writes are limited to 1 MiB. Prefer `Storage` for normal
+  script state.
+- Sandboxed `require` loads text-only Lua modules from the allowed script/library
+  roots under the same restricted environment. Do not depend on native C-module
+  loading or DLL search paths.
+- Current builds do not export `Game.GetMinimapTilePixelColor`.
+  `Minimap.GetTilePixelColor` and `Minimap.IsWalkableByColor` are compatibility
+  capability calls and return `nil`; use `Minimap.GetTileFlags`,
+  `Minimap.IsWalkable`, or `Map` pathfinding.
 
 ## Critical Constants (Explicit Values)
 Use these exact values to avoid numeric mapping mistakes.
@@ -182,6 +281,7 @@ A script may own up to four simultaneous WebSockets; eight are allowed across al
 
 ### features.lua
 Public feature control wrappers.
+
 - Supports identifiers by numeric BotFeatureId or feature name string.
 - Public IDs are HEALER..TIMER_ACTIONS.
 - Objects Dumper is reserved and intentionally blocked.
@@ -200,8 +300,16 @@ Primary API:
 - Features.DisableAllExcept(excludeList)
 - Features.PrintStatus()
 
+`Enable` and `Disable` use the native idempotent `SetActive` operation and return
+the resulting active state. `Toggle` also returns the new state, but should be
+used only when inversion is the intended operation. Feature activation changes
+live bot state; the feature's own settings remain intact.
+
 ### Magic Shooter entries
-Lua scripts can inspect and configure existing Magic Shooter entries without switching profiles or rebuilding them:
+Lua scripts can inspect and configure existing Magic Shooter entries without
+rebuilding profiles. Magic Shooter uses one normalized action model for spells,
+runes, directional attacks, target-centered areas, chains, support effects, and
+stances:
 
 - `Engine.MagicShooter.GetEntries(profile?) -> entries|nil, error?`
 - `Engine.MagicShooter.SetEntryRune(entryIndex, runeId, profile?) -> success, error?`
@@ -209,11 +317,92 @@ Lua scripts can inspect and configure existing Magic Shooter entries without swi
 - `Engine.MagicShooter.SetEntryEnabled(entryIndex, enabled, profile?) -> boolean`
 - `Engine.MagicShooter.SetEntryMonsterNames(entryIndex, names, profile?) -> boolean`
 - `Engine.MagicShooter.SetEntryRange(entryIndex, range, profile?) -> boolean`
-- Explicit setters also exist for option, condition, mana/health/harmony thresholds, monster count and comparison, monster HP range, danger, PvP safety, ally shooting, target requirement, custom/walk/momentum delays, skill-buff percentages, movement/momentum flags, cast method, and pattern anchor/source/variant.
+- Invocation and placement: `SetEntryCastMethod`, `SetEntryPatternAnchor`, `SetEntryPatternSource`, `SetEntryPatternVariant`, and `SetEntryPatternId`.
+- Evaluation and ordering: `SetEntryEffectType`, `SetEntryPriorityLane`, `SetEntryTargetPolicy`, `SetEntryHitCountMode`, `SetEntryMonsterCount`, and `SetEntryMonsterCountCondition`.
+- Chain behavior: `SetEntryChainMaxTargets`, `SetEntryChainJumpRange`, and `SetEntryChainSelector`.
+- Requirements/effect tracking: `SetEntryEquipmentRequirement` and `SetEntryTrackedEffect`.
+- Explicit setters also exist for option, condition, mana/health thresholds, monster HP range, danger, PvP safety, ally shooting, target requirement, custom/walk/momentum delays, skill-buff percentages, and movement/momentum flags.
 
 `profile` defaults to the active Magic Shooter profile. It may be a 1-based profile index or an exact profile name. Entry indexes are also 1-based and match the order shown in the selected profile. `GetEntries` returns a detached snapshot with all public condition, threshold, delay, safety, skill-buff, and pattern fields. Editing that returned table has no effect; call the matching setter.
 
-Replacing an action preserves that entry's enabled state, position, monster names, creature-count/health/mana conditions, delays, and advanced settings. A recognized rune or spell also updates its action type, range, and built-in pattern using the same automatic detection as the Magic Shooter UI. An unknown custom action can replace an entry that is already the same kind, but cannot cross from rune to spell or spell to rune because the missing action metadata would be ambiguous. Changes affect the live in-memory profile and are included by a later normal settings save.
+The enum tables live under `Engine.MagicShooter`: `Option`, `Condition`,
+`CastCondition`, `MonsterCountCondition`, `CastMethod`, `PatternAnchor`,
+`PatternSource`, `PatternVariant`, `EffectType`, `PriorityLane`, `TargetPolicy`,
+`HitCountMode`, `EquipmentRequirement`, `TrackedEffect`, and `ChainSelector`.
+Use these named constants instead of hard-coded integers. `PatternVariant`
+exposes only `Default` and `Custom`; numeric value `1` is reserved and rejected.
+
+Runtime selection is strict vector order. On every pass Magic Shooter starts at
+entry 1, checks that entry's complete type-specific conditions and cooldowns,
+then continues downward only when it cannot use that entry. The first fully
+eligible entry is used. Spell/rune type, area size, `PriorityLane`, and
+`dangerLevel` do not reorder evaluation. Those advanced fields remain readable
+and settable for profile/model compatibility, but scripts must arrange actual
+priority by moving entries in the profile UI.
+
+Conditions are evaluated per entry, including `DontCastWhileWalking`; enabling
+that option on one entry does not suppress a later entry that permits casting
+while walking. Creature candidates are read from current game storage while the
+entry is being evaluated. There is no shared Lua-style creature snapshot whose
+contents can be edited or reused to change the selection.
+
+Chain entries can count guaranteed hits or possible hits. `ChainSelector` provides `Closest`, `Random`, and `HighestHealth`; use the named constant because historical and current chain spells may use different selectors. Monster name, HP, and tracked-effect filters decide which chained monsters count toward the condition, but excluded creatures may still physically relay a chain. PvP safety follows the complete possible chain and rejects a cast that could reach a non-allowed player. Current-target chains fall back to a valid in-range creature when necessary.
+
+For directly targeted actions (runes and supported crosshair spells), `SetEntryRequiresTarget(false)` allows the configured target-selection policy to choose a valid creature without requiring an existing client attack target. Ordinary spoken targeted spells still resolve against Tibia's current attack target and cannot be redirected by a bot-only policy.
+
+Monster names are case-insensitive and accept comma, semicolon, or newline separators. Range, floor, shootability, monster HP, and Monster Name filters are applied consistently to spells and runes. PvP safety is evaluated independently of monster-name and HP filters.
+
+Momentum is the sole intentional priority exception. When the Momentum effect is
+triggered, Magic Shooter scans from the top for the first enabled attack spell
+or attack rune with `PrioritizeWithMomentum` enabled whose individual cooldown
+is at most its configured `MomentumDelay`. That entry is reserved for the
+Momentum window. Until it fires or the window expires, other attack spells and
+runes are skipped. Stances, empowerment/support entries, challenge/exeta, and
+avatar entries may still run. The option is meaningful only for attack spells
+and runes; scripts should not enable it for support/stance entries.
+
+`SetEntryCustomDelay` also provides the retry window for custom actions whose
+cooldown is not exposed by the client; when a normal entry is waiting, scanning
+continues to the next entry. `SetEntryAttackSkillBuffSpell` remains for old
+support entries, but new scripts should prefer `TrackedEffect.SkillBuff`.
+
+x64-only controls are exported only when supported by the native client build.
+Harmony and Monk-specific controls belong to x64 clients from 15.00 onward.
+`CrossHairSpell`, `TargetOrSelf`, stance behavior/effect tracking, and
+`SetEntryStanceGroup`, `SetEntryStanceId`, and
+`SetEntryForceUnknownStance` require the newer x64 client features from 15.25
+onward. None exist in the x86 API. Check
+`type(Engine.MagicShooter.SetEntryStanceId) == "function"` when targeting both
+architectures.
+
+The stance tracker observes outgoing manual and scripted stance words even while
+Magic Shooter is disabled. It groups mutually exclusive stances, tracks a
+pending cast, confirms it from spell cooldown/exhaustion, and abandons an
+unconfirmed attempt after two seconds. Casting the currently active stance is
+tracked as toggling that group off. State resets to unknown after injection or a
+character change. By default an unknown group does not force a cast; enable
+`SetEntryForceUnknownStance` only for the entry that should establish the
+initial state.
+
+To build a sequence such as `uteta flam`, then a fire attack, then another
+attack, place those entries in that order. The stance entry runs only when its
+group is not already in the requested state. Subsequent strict-order passes can
+then reach the dependent attack and later fallback entries as their own
+conditions/cooldowns allow.
+
+Replacing an action preserves that entry's enabled state, position, monster
+names, creature-count/health/mana conditions, delays, momentum option, stance
+fields, and advanced settings. A recognized rune or spell also updates its
+action type, range, and built-in pattern using the same automatic detection as
+the Magic Shooter UI. An unknown custom action can replace an entry that is
+already the same kind, but cannot cross from rune to spell or spell to rune
+because the missing action metadata would be ambiguous.
+
+Entry/profile fields changed through Lua affect live in-memory settings and are
+included in a later normal settings save. Older settings files load with safe
+defaults for newly added fields, and the next save writes the new fields.
+Momentum timestamps, pending/active stance tracking, per-entry retry timers, and
+other transient runtime state are intentionally not persisted.
 
 ### Targeting entries
 
@@ -295,6 +484,22 @@ Primary API:
 - Module.Exists(name)
 - Module.Get(name)
 - Module.List()
+
+`Module.New` creates a repeating managed coroutine. Its callback may call
+`wait(...)`; it must not busy-loop. `Module.Every` is the recommended repeating
+helper: it stops an existing module with the same name before registering the new
+one and records it in the core helper registry. `Module.After` is a one-shot
+managed coroutine that waits, invokes the callback once, then removes itself.
+`Module.Cancel`, `PauseManaged`, `ResumeManaged`, `Exists`, `Get`, and `List`
+operate on modules created through `Every` or `After`; raw `Module.New` modules
+are not added to that Lua-side registry.
+
+Names must be non-empty and should be stable and script-specific. Delays are
+integer milliseconds from 0 through 86,400,000. An uncaught callback error is
+reported with script/module context and stops the offending module. It stops the
+entire script only when no healthy sibling work remains. Do not wrap the whole
+repeating callback in `pcall`; catch only an operation whose failure is expected
+and recoverable.
 
 ### position.lua
 Position object utilities and spatial checks.
@@ -559,6 +764,29 @@ Primary API:
 - Spells.GetInfo(spellWordsOrId)
 - Spells.Item.* for rune/item cooldown APIs
 
+### Native Events API
+
+Use the high-level `Hotkeys`, `Cavebot`, and proxy APIs when one matches the
+task. The native `Events` table is available for direct scheduling and custom
+registrations:
+
+- `Events.Schedule(callback, delayMs, ...args) -> string` returns an owner-scoped event ID.
+- `Events.GetScheduledEvents() -> string[]` returns this script's pending IDs.
+- `Events.CancelScheduledEvent(eventId) -> boolean` cancels a pending callback.
+- `Events.RegisterKeyEvent(options) -> string` registers a key callback and returns its opaque registration ID; use `Hotkeys.RegisterCombo` for normal combinations.
+- `Events.RegisterPacketEvent(options) -> string` accepts `id`, `packet_id` (one opcode or an array), `callback`, and optional `incoming` (default `true`), then returns its opaque registration ID.
+- `Events.RegisterWalkerEvent(eventId, callback) -> integer|nil` returns a function reference for singular unregistration.
+- `Events.UnregisterKeyEvent(registrationId)`, `UnregisterPacketEvent(registrationId)`, and `UnregisterWalkerEvent(functionRef)` return booleans. Pass the exact opaque value returned at registration. A stale or foreign ID returns `false` and cannot remove another script's callback.
+- `Events.UnregisterAllKeyEvents()`, `UnregisterAllPacketEvents()`, and `UnregisterAllWalkerEvents()` remove this script's registrations.
+
+All registrations and scheduled callbacks are owned by the current script and
+are removed automatically when it stops. Scheduled callbacks run as managed
+coroutines and may yield. A scheduled callback failure ends only that callback.
+An event callback is disabled after exactly three consecutive uncaught failures;
+one successful terminal invocation resets its failure count. At most 64 event
+callbacks may be pending for a script, so callbacks should be short and should
+coalesce or discard replaceable telemetry rather than building a backlog.
+
 ### event_proxies.lua
 Event proxy wrappers for common game event categories.
 
@@ -613,10 +841,21 @@ Primary namespaces:
 - Engine.TimerActions
 - Engine.SuppliesSorter
 - Engine.HUD
+- Engine.Scripter
+- Engine.Delays
 
 Use `Engine.Features` to query, enable, disable, or toggle public bot features, including Supplies Sorter. IDs for internal object dumping, queue/event infrastructure, and the scripter are rejected by the native boundary. `Engine.Equipment` provides live equipped-slot data and equipment actions; it is distinct from Equipment Manager's saved configuration. Magic Shooter and Targeting expose profile and explicit entry control.
 
 The older global `Features`, `Inventory`, `PVPTools`, `MagicShooter`, and `Targeting` tables remain available for compatibility. New scripts should prefer the corresponding `Engine.*` namespaces.
+
+Getters return values or detached tables; editing a returned entry/list never
+edits native feature state. Use the matching explicit setter so validation,
+parsed caches, timers, queued work, packet subscriptions, and HUD refresh side
+effects remain correct. `Engine.Walker.Defer(timeoutMs)` and
+`CompleteDeferred(token)` implement Walker's blocking-decision
+handshake. Complete or allow every accepted token before its timeout.
+`Engine.Lure.UpdateSetting(index, setting)` updates an existing copied lure
+setting using native validation.
 
 ### cavebot.lua
 High-level cavebot orchestration wrappers over Walker and Lure Manager feature toggles.
@@ -632,24 +871,73 @@ Primary API:
 - Cavebot.IsLureEnabled()
 - Cavebot.SetEnginesEnabled(walkerEnabled, lureEnabled)
 - Cavebot.Resume()
+- Cavebot.Defer(timeoutMs)
 - Cavebot.GoTo(labelName)
 - Cavebot.GoToLabel(labelName)
 - Cavebot.Pause(milliseconds, autoResume)
 - Cavebot.RegisterEvent(eventId, callback)
-- Cavebot.OnLabel(callback)
+- Cavebot.ObserveLabel(callback)
+- Cavebot.ObserveAction(callback)
+- Cavebot.ObserveWaypointChange(callback)
+- Cavebot.OnActionStarted(callback)
+- Cavebot.OnActionCompleted(callback)
 - Cavebot.OnWaypointChange(callback)
-- Cavebot.OnAction(callback)
+- Cavebot.InterceptLabel(callback)
+- Cavebot.InterceptAction(callback)
+- Cavebot.OnLabel(callback) (legacy blocking alias)
+- Cavebot.OnAction(callback) (legacy blocking alias)
 - Cavebot.UnregisterAllEvents()
 - Cavebot.GetStatus()
 - Cavebot.PrintStatus()
+
+`ObserveLabel`, `ObserveAction`, and `ObserveWaypointChange` are non-blocking
+telemetry callbacks and cannot pause Walker by registering. `ObserveAction`
+reports that an Action waypoint was reached, before any blocking interceptor has
+finished; it is not a success signal. `OnWaypointChange` is retained as a
+compatibility alias for `ObserveWaypointChange`.
+`ObserveWaypointChange` receives one table containing `previousIndex`, `index`,
+`type`, `x`, `y`, `z`, `label`, `labelName`, and `uniqueId`; indices are
+one-based and `previousIndex` is `nil` for the initial selection.
+
+`OnActionStarted` and `OnActionCompleted` are the truthful, non-blocking Action
+lifecycle APIs. Each receives one table. Both tables contain `executionId`,
+`action`/`name`, the numeric Action `kind`, and a `waypoint` table with `index`,
+`uniqueId`, `x`, `y`, and `z`. The completion table additionally contains:
+
+- `ok`: `true` only when the Action reached a successful terminal result.
+- `outcome`: `success`, `skipped`, `failure`, `timeout`, or `cancelled`.
+- `description`: the result or error description.
+- `result`: the description on success; otherwise `nil`.
+- `error`: the description on failure; otherwise `nil`.
+- `durationMs`: elapsed milliseconds from actual Action start to completion.
+
+Use `executionId` to correlate a start with exactly one terminal completion.
+Action start is dispatched only after legacy Action interceptors have released.
+Changing the selected waypoint, replacing or deleting the Action, clearing or
+reloading the route, or resetting Walker completes an active Action as
+`cancelled`; it is never reported as successful merely because it started.
+
+`OnLabel` and `OnAction` retain their historical blocking behavior.
+`InterceptLabel` and `InterceptAction` are the preferred explicit names when a
+script deliberately needs that behavior.
+
+Blocking interceptors release automatically when their callback returns.
+`Cavebot.Defer(timeoutMs)` may be called only inside an interceptor when work
+must continue after the callback returns. It returns an owner-scoped handle with
+`handle:Complete()` and `handle:Cancel()`; both release the hold, return `true`
+only on the first successful release, and cannot release another script's hold.
+`timeoutMs` must be between 1 and 60000, and expiration fails open.
 
 Walker namespace (full runtime wrappers):
 - Cavebot.Walker.SetEnabled(enabled)
 - Cavebot.Walker.IsEnabled()
 - Cavebot.Walker.Resume()
+- Cavebot.Walker.Defer(timeoutMs)
+- Cavebot.Walker.CompleteDeferred(token)
 - Cavebot.Walker.GoTo(labelName)
 - Cavebot.Walker.GetSelectedWaypointIndex()
 - Cavebot.Walker.SetSelectedWaypointIndex(index)
+- Cavebot.Walker.SetWaypointPosition(index, x, y, z)
 - Cavebot.Walker.SelectClosestWaypoint()
 - Cavebot.Walker.GetWaypointCount()
 - Cavebot.Walker.GetWaypoints()
@@ -730,7 +1018,7 @@ Lure namespace (full runtime wrappers):
 - Cavebot.Lure.SetForceLure(enabled)
 - Cavebot.Lure.IsForceLure()
 - Cavebot.Lure.EndForceLure()
-- Cavebot.Lure.SetOption(option)
+- Cavebot.Lure.SetOption(option) -- 0 = Start/End, 1 = Dynamic, 2 = Kiting
 - Cavebot.Lure.GetOption()
 - Cavebot.Lure.SetNearRange(range)
 - Cavebot.Lure.GetNearRange()
@@ -775,11 +1063,69 @@ Primary API:
 - Sound.SetMinDelay(delayMs)
 - Sound.GetCurrentDuration()
 - Sound.GetFileDuration(filePath)
+- Sound.PlayById(soundId, instant?)
+- Sound.PlayByName(soundName, instant?)
+- Sound.PlayFile(filePath, instant?)
+- Sound.StopAll()
+- Sound.GetQueueLength()
+- Sound.PlayAndWait(options, maxWaitMs?)
+- Sound.WaitForCompletion(maxWaitMs?)
+- Sound.PlayByIdSmart(soundId, instant?)
+- Sound.PlayByNameSmart(soundName, instant?)
+- Sound.PlayFileSmart(filePath, instant?)
+- Sound.PlayBotSound(nameOrWavFilename, instant?)
 
-`Sound.Play` and `Sound.IsQueued` options must identify exactly one source: `sound_id = BotSoundId.*`, `sound_name = string`, or `file_path = string`. `Sound.Play` also accepts `instant = boolean`. Use these canonical methods rather than legacy global sound helper functions.
+`Sound.Play` and `Sound.IsQueued` options must identify exactly one source:
+`sound_id = BotSoundId.*`, `sound_name = string`, or `file_path = string`.
+`Sound.Play` also accepts `instant = boolean`. Built-in IDs are exactly 0 through
+13 (`DISCONNECTED` through `UNJUSTIFIED_KILL`); there are no custom IDs 14
+through 18. `PlayBotSound` resolves a canonical built-in name and strips an
+optional `.wav` suffix. For an arbitrary WAV file, pass its explicit absolute
+path to `PlayFile` or `Sound.Play({ file_path = ... })`; do not construct an old
+Documents/ValidusBot alarm path.
+
+Playback, queue state, and stop/cleanup are owner-scoped, so one script cannot
+claim another script's playback as its own. `SetMinDelay` changes the shared
+sound manager delay and accepts 0 through 60,000 ms. The waiting helpers must run
+inside a managed coroutine because they yield, and they use `Time.MonotonicMs`
+instead of wall/CPU time. Smart helpers return `false` when the same source is
+already queued or playing.
+
+### Time
+
+- `Time.MonotonicMs() -> integer`
+
+Returns milliseconds from an unspecified monotonic epoch. Use differences
+between readings for elapsed-time decisions. The runtime uses the same
+`std::chrono::steady_clock` basis for scheduler deadlines.
+
+### Script lifecycle and cross-script control
+
+The current script's top-level body is executed first and its optional `init()`
+is then invoked as a managed coroutine. Define `init()` for setup that may yield.
+Define `terminate()` for short, synchronous cleanup only: it is protected,
+non-yielding, called at most once, and has a 50 ms limit. Native owner-scoped
+modules, schedules, events, HUD elements, sounds, network handles, and async
+tokens are cleaned even if Lua cleanup fails.
+
+- `Engine.Scripter.GetAvailableScripts()` lists exact runnable `.lua` filenames.
+- `Engine.Scripter.Start(name)`, `Stop(name)`, and `Restart(name)` operate on those exact names.
+- `Engine.Scripter.Refresh()` refreshes the script list.
+- `Engine.Scripter.GetRunningScripts()` reports currently active script names.
+- `Engine.Scripter.GetOutput(name)` returns current output or the most recently archived output.
+- `Engine.Scripter.StopSelf()` is the only supported way for a running script to stop itself.
+- `Script.Unload()` remains a compatibility self-stop call; prefer `StopSelf`.
+
+A script cannot use `Stop(name)` or `Restart(name)` on itself and cannot disable
+the sandbox or execute an arbitrary source string. Every script writes its own
+runtime log under the product `UserData/BotLogs` area, including explicit PASS
+and FAIL messages printed by test scripts. `GetOutput` is read-only and returns
+an empty string when no current or archived output exists.
 
 ### storage.lua
-Persistent JSON-compatible values scoped to the current script. No file paths or manual serialization are needed.
+Persistent JSON-compatible values with per-script scopes and explicit named
+scopes shared between scripts. No file paths or manual serialization are
+needed. Existing per-script behavior is unchanged.
 
 Direct scopes:
 - Storage.Global.Get(key, default?) / Set(key, value) / Remove(key) / Clear()
@@ -790,7 +1136,107 @@ Logical namespaces:
 - Storage.ForCharacter(namespace)
 - scope:Get(key, default?) / Set(key, value) / Remove(key)
 
-Global values are shared by characters running the same script; character values are isolated by the logged-in character. Namespaces must be non-empty, at most 64 bytes, and contain only letters, numbers, `_`, `-`, and `.`. A namespace plus key may not exceed 256 bytes. Supported values are nil, booleans, finite numbers, strings, and nested tables with string keys or contiguous 1-based array indexes. Cyclic tables are rejected. Storage is limited to 2 MB per script, 12 nested levels, and 4,096 entries per table. Prefer a stable, script-specific namespace to avoid key collisions.
+Named cross-script scopes:
+- Storage.Shared(namespace)
+- Storage.SharedForCharacter(namespace)
+- shared:Get(key, default?) -> value, errorMessage?
+- shared:Set(key, value) -> success, errorMessage?
+- shared:Remove(key) -> success, errorMessage?
+- shared:Clear() -> success, errorMessage?
+- shared:Update(key, updater, default?) -> success, newValue, errorMessage?
+- shared:OnChanged(callback, key?, includeSelf?) -> subscriptionId?, errorMessage?
+- shared:OffChanged(subscriptionId) -> success, errorMessage?
+
+`Storage.Global`, `Storage.Character`, `Storage.Namespace`, and
+`Storage.ForCharacter` remain private to the current script file. "Global" in
+that API means every character running that one script; it does not mean every
+Lua script.
+
+`Storage.Shared("name")` opens a durable namespace available to every script,
+including temporary Walker Lua waypoints. `Storage.SharedForCharacter("name")`
+opens the same named file but selects data isolated by the currently logged-in
+character. Any installed script that knows a shared namespace can access it, so
+a namespace is a coordination boundary rather than a security boundary.
+
+Use `Update` for read-modify-write operations which must not lose concurrent
+changes:
+
+```lua
+local state = Storage.SharedForCharacter("cavebot.supplies")
+local success, visits, updateError = state:Update("visits", function(current)
+    return (current or 0) + 1
+end)
+```
+
+The updater runs without a native or filesystem lock and may run again when a
+different script or bot process wins a concurrent write. It should therefore
+be deterministic and free of external side effects. Returning nil removes the
+key. If `default` is a table, do not mutate that table in place; construct and
+return a new table instead. Updates retry at most eight times and then return
+an error instead of blocking indefinitely.
+
+Shared operations coordinate across scripts and bot processes, use bounded
+lock waits, revisions, and atomic file replacement. Calls may still perform
+local disk I/O, so storage should persist meaningful state transitions rather
+than act as a per-frame message bus. Keep frequently changing values in Lua
+memory and persist them only when needed.
+
+Use `OnChanged` to receive committed mutations from other scripts in the same
+injected bot process. Pass a key to observe one field or nil to observe the
+whole selected scope. Notifications exclude writes made by the subscribing
+script unless `includeSelf` is true. The returned subscription is owned by the
+script, keeps it alive as an event resource, and is removed automatically when
+the script stops; `OffChanged` removes it early.
+
+```lua
+local state = Storage.Shared("cavebot.supplies")
+local subscriptionId, subscribeError = state:OnChanged(function(event)
+    print(event.operation, event.key, event.writer.name, event.revision)
+    if event.newValueIncluded then
+        print("new value:", event.newValue)
+    end
+end, "visits")
+```
+
+The callback receives a table with `namespace`, `operation` (`set`, `remove`,
+or `clear`), `scope`, `revision`, `timestampUnixMs`, and a `writer` table with
+stable process-local `id`, human-readable `name`, and `type` (`script`,
+`walker`, or `one_shot`). Key-specific events also include `key`,
+`previousExists`, `newExists`, `previousValueIncluded`, `newValueIncluded`, and
+the corresponding `previousValue`/`newValue` fields when included. A whole-scope
+clear instead reports `changedCount`, up to 256 `changedKeys`, and
+`changedKeysTruncated`. Individual values larger than 256 KiB are omitted from
+the notification while their existence flags remain accurate; the subscriber
+can call `Get` when it needs the large current value.
+
+Change callbacks are queued only after the storage lock is released and run as
+normal managed event coroutines. They may yield and may access storage safely.
+The standard event failure policy disables a subscription after three
+consecutive uncaught callback failures. Each script may own at most 64 shared
+storage subscriptions; the native notification queue is bounded to 32 events
+and 8 MiB, the process accepts at most 512 subscriptions, and callback fan-out
+is time-sliced to 128 admissions per manager pass. Remaining deliveries stay
+queued, so a writer cannot grow DLL memory or monopolize the game thread
+without limit.
+
+Notifications are process-local: storage writes remain safe across bot
+processes, but a change made by another injected client is observed on the next
+explicit `Get`, not through `OnChanged`. Reads do not emit access events. That
+avoids recursion (`Get` causing a callback which calls `Get` again), unnecessary
+disk traffic, and leaking read activity between cooperating scripts. Use an
+explicit audit key if scripts need to record meaningful reads.
+
+Subscriptions and event metadata exist only at runtime. They do not change the
+shared-storage JSON format, so existing storage files and Lua scripts remain
+compatible.
+
+Namespaces must be non-empty, at most 64 bytes, and contain only letters,
+numbers, `_`, `-`, and `.`. Per-script namespace plus key combinations and
+shared keys may not exceed 256 bytes; shared keys cannot contain NUL bytes.
+Supported values are nil, booleans,
+finite numbers, strings, and nested tables with string keys or contiguous
+1-based array indexes. Cyclic tables are rejected. Each storage file is limited
+to 2 MB, 12 nested levels, and 4,096 entries per table.
 
 ### vip.lua
 Read-only VIP/contact queries through the canonical `VIP` table.
@@ -846,7 +1292,7 @@ local overlayTitle = ScreenText:New("overlay_title", HUDRenderLayer.OVERLAY)
 -- Equivalent builder form:
 local overlayIcon = ScreenImage:New("overlay_icon")
     :SetRenderLayer(HUDRenderLayer.OVERLAY)
-    :SetSourceBase64(MY_PNG_BASE64)
+    :SetSourceBase64(MY_PNG_OR_GIF_BASE64)
     :SetSize(32, 32)
     :SetScreenPosition(760, 120)
     :Create()
@@ -856,9 +1302,13 @@ Screen image notes:
 - ScreenImage:SetLabel(text, color, offsetX, offsetY) attaches or updates text on the image.
 - ScreenImage:SetScreenPosition(x, y) positions image HUD elements in screen pixels.
 - ScreenImage:SetParent(parent_id) can parent icons to a draggable ScreenText handle; children keep their current offset when the parent moves.
-- ScreenImage:SetSourceBase64(base64Png) and WorldImage:SetSourceBase64(base64Png) embed PNG data directly in the script. Raw Base64 and `data:image/png;base64,...` values are accepted.
-- ScreenImage:SetSourceBytes(pngBytes) and WorldImage:SetSourceBytes(pngBytes) accept a contiguous Lua array of integer bytes, including hexadecimal literals such as `{0x89, 0x50, 0x4E, 0x47, ...}`.
-- Embedded sources are PNG-only. Encoded data is limited to 4 MiB and decoded dimensions to 2048x2048. Choose exactly one source setter per image; calling another source setter replaces the prior selection.
+- `ScreenImage:SetSource(path)` and `WorldImage:SetSource(path)` load PNG, JPG, or animated GIF files from a full path. Asynchronous PNG/GIF loading requires a local path; remote/UNC PNG/GIF paths are rejected so script shutdown cannot be held by network filesystem I/O.
+- `ScreenImage:SetSourceBase64(base64Image)` and `WorldImage:SetSourceBase64(base64Image)` embed PNG or animated GIF data directly in the script. Raw Base64, `data:image/png;base64,...`, and `data:image/gif;base64,...` values are accepted.
+- `ScreenImage:SetSourceBytes(imageBytes)` and `WorldImage:SetSourceBytes(imageBytes)` accept either a contiguous Lua array of integer bytes or a binary Lua string, including hexadecimal PNG or GIF bytes.
+- Animated GIF frames and their frame delays are preserved for both screen and world images. GIF delays are bounded to 33-1000 ms per frame.
+- PNG/GIF file reads, Base64 parsing, and image decompression run asynchronously. `Create()` returns after queuing the HUD element; the image becomes visible when decoding finishes. Removing the element or stopping its script safely cancels or discards unfinished work.
+- Embedded image data is limited to 4 MiB. A Lua byte-array table is limited to 128 KiB so copying it cannot monopolize the client thread; use Base64 or a binary string for larger embedded images. PNG dimensions are limited to 2048x2048. GIFs are limited to 512x512, 64 frames, and a bounded total decoded size.
+- Choose exactly one source setter per image; calling another source setter replaces the prior selection.
 
 Text font notes:
 - `ScreenText` and `WorldText` use Tibia's HUD font and size by default.
@@ -890,30 +1340,29 @@ These examples are intentionally small, defensive, and written in the public Pas
 
 ### 1. Repeating Low HP Sound Alert
 
-Use `Module.Every` for repeating work, check that the player is available, and wrap runtime logic with `pcall` so one temporary failure does not kill the script.
+Use `Module.Every` for repeating work and check that the player is available.
+Leave unexpected failures uncaught so the runtime can log and isolate the
+module. Add a narrow `pcall` only around an operation that has a defined
+recoverable fallback.
 
 ```lua
 local SCRIPT_ID = "low_hp_sound_example"
 
-local function safe(fn, label)
-    local ok, err = pcall(fn)
-    if not ok then
-        print("[" .. SCRIPT_ID .. "] " .. label .. " failed: " .. tostring(err))
+local function tick()
+    if not Self.IsAvailable() then
+        return
+    end
+
+    local hp = Self.GetHealthPercentage()
+    if type(hp) == "number" and hp <= 35 then
+        Sound.PlayByIdSmart(BotSoundId.LOW_HEALTH)
     end
 end
 
-Module.Every(SCRIPT_ID .. "_tick", function()
-    safe(function()
-        if not Self.IsAvailable() then
-            return
-        end
-
-        local hp = Self.GetHealthPercentage()
-        if type(hp) == "number" and hp <= 35 then
-            Sound.Play({ sound_id = BotSoundId.LOW_HEALTH })
-        end
-    end, "tick")
-end, 1000)
+function init()
+    Module.Every(SCRIPT_ID .. "_tick", tick, 1000)
+    print("[" .. SCRIPT_ID .. "] PASS: initialized")
+end
 ```
 
 ### 2. Scan Visible Monsters
@@ -1078,13 +1527,21 @@ Do not generate scripts that call old lower-camel names or undocumented low-leve
 
 ## Script Safety Checklist
 Before finalizing any script, verify:
-1. All loops yield (wait/module schedule) and cannot freeze runtime.
-2. Every table access checks nil/type when data can be absent.
-3. Feature operations do not touch reserved features.
-4. Hotkeys avoid unsupported alt modifier.
-5. Position/creature access handles invalid objects safely.
-6. Actions with IDs validate integers and positive ranges.
-7. Script can be stopped cleanly (no destructive side effects).
+
+1. All loops yield with `wait`, a module, or a scheduled callback and cannot freeze the game thread.
+2. Every table access checks nil/type when live game or feature data can be absent.
+3. Only documented PascalCase APIs and named enum constants are used.
+4. Feature operations do not touch reserved/internal features and use idempotent Set/Enable/Disable calls.
+5. Alt is not used for registered callback hotkeys; it is allowed only for synthetic `Hotkeys.SendCombo`.
+6. Position/creature access handles invalid, despawned, or cross-floor objects safely.
+7. IDs, indexes, percentages, delays, and ranges are validated before mutation.
+8. Repeating modules are not hidden inside a blanket `pcall`; recoverable catches are narrow and logged.
+9. Callback work is bounded, event backlogs are avoided, and delays use monotonic time.
+10. Detached getter snapshots are never edited as if they were live settings.
+11. Every accepted Walker defer token is completed or intentionally allowed to time out.
+12. `terminate()` is synchronous, non-yielding, fast, and restores any non-owner-scoped setting the script intentionally changed.
+13. Stable IDs/names are used for modules, events, hotkeys, HUD elements, and storage namespaces.
+14. Tests print explicit PASS and FAIL results so both UI output and per-script log files are useful.
 
 ## Recommended Script Template
 Use this as baseline for generated scripts.
@@ -1096,40 +1553,61 @@ local function log(msg)
     print("[" .. SCRIPT_ID .. "] " .. tostring(msg))
 end
 
-local function safe_run(fn, context)
-    local ok, err = pcall(fn)
-    if not ok then
-        log("ERROR in " .. tostring(context) .. ": " .. tostring(err))
-    end
-end
-
 local function tick()
-    -- Put guarded logic here.
-    -- Always assume runtime values can be nil.
+    if not Self.IsAvailable() then
+        return
+    end
+
+    -- Keep work bounded. Let unexpected errors reach the runtime so this
+    -- module is logged and isolated. Use pcall only for a known recoverable
+    -- operation with a real fallback.
 end
 
-Module.Every(SCRIPT_ID .. "_tick", function()
-    safe_run(tick, "tick")
-end, 200)
+function init()
+    Module.Every(SCRIPT_ID .. "_tick", tick, 200)
+    log("PASS: initialized")
+end
 
-log("started")
+function terminate()
+    -- Do not call wait() here. Native owner-scoped resources are cleaned
+    -- automatically; only restore intentional shared/live setting changes.
+    log("stopped")
+end
 ```
 
 ## LLM Generation Rules (Copy Into Prompt)
 When generating ValidusBot Lua scripts:
-1. Use only APIs documented in this file.
-2. Prefer core wrappers over raw low-level calls.
-3. Include argument validation and nil checks.
-4. Never use alt for hotkeys.
-5. Never use or toggle Objects Dumper feature.
-6. For repeated logic, use Module.Every/Module.After or wait-based yielding.
-7. Return complete runnable script with concise comments.
-8. Avoid placeholders like TODO unless explicitly requested.
+
+1. Use only exact APIs and enum names documented in this file and its generated appendix; never invent a getter, action, or generic update table.
+2. Prefer canonical core wrappers and `Engine.*` namespaces over compatibility globals or underscore-prefixed bindings.
+3. Include argument validation and nil/type checks for unavailable live state.
+4. Use Alt only with `Hotkeys.SendCombo`, never with callback registration.
+5. Never use or toggle the Objects Dumper or another internal/reserved feature.
+6. For repeated logic, use `Module.Every`; for one-shot work, use `Module.After` or `Events.Schedule`; all loops must yield.
+7. Keep callbacks small because Lua shares the game thread and is cooperatively budgeted.
+8. Do not blanket-`pcall` repeating modules. Catch only expected recoverable failures, log them, and preserve a useful fallback.
+9. Treat getter tables as snapshots and change bot state only through explicit setters/actions.
+10. Use `Time.MonotonicMs()` for elapsed time and `Storage` for JSON-compatible persistent script state.
+11. Put yieldable setup in `init()` and only fast, non-yielding cleanup in `terminate()`.
+12. Use stable owner-scoped names and emit explicit PASS/FAIL lines in diagnostic scripts.
+13. Return one complete runnable `.lua` file with concise comments and no TODO placeholders unless requested.
+
+## LLM API-selection workflow
+
+For each requested behavior, an LLM should:
+
+1. Find the canonical signature in Appendix A and named constants in Appendix B.
+2. Prefer the highest-level matching wrapper (`Cavebot`, `Hotkeys`, `Cooldowns`, `Spells`, `Sound`, `Storage`, or a HUD class).
+3. Use `Engine.<Feature>` only for explicit feature configuration or actions, and call a setter rather than editing a getter snapshot.
+4. Decide whether the work is immediate, repeating, one-shot, or event-driven and choose `init`, `Module.Every`, `Module.After`/`Events.Schedule`, or an event proxy accordingly.
+5. Add capability checks for architecture/client-version-specific functions and nil checks for unavailable game state.
+6. Identify owner-scoped resources and any shared/live setting that must be restored in `terminate()`.
+7. Ensure errors remain observable, callbacks stay bounded, and validation/test output states PASS or FAIL explicitly.
 
 ## Example Prompt for ChatGPT/Claude
 Use this prompt with this file attached:
 
-"Generate a production-safe ValidusBot Lua script using only APIs from the attached spec. Script goal: <describe goal>. Include robust nil checks, validation, and non-blocking scheduling. Do not use unsupported modifiers/features. Return one complete .lua file."
+"Generate a production-safe ValidusBot Lua script using only exact APIs from the attached spec and its generated appendix. Script goal: <describe goal>. Prefer canonical high-level wrappers, validate live values, use managed yielding/scheduling, keep callbacks bounded, and let unexpected module errors reach the runtime. Use Alt only for synthetic SendCombo calls. Return one complete .lua file with explicit diagnostic logging and no invented APIs."
 
 
 ---
@@ -1146,8 +1624,11 @@ Important behavior:
 - Explicit setters validate types and ranges and preserve feature side effects such as timer resets, parsed-name cache rebuilds, packet-event refreshes, and HUD state refreshes.
 - `Engine.ComboBot.GetRoomState()` omits room passwords and transport details. Lua cannot connect, disconnect, or send raw Combo Bot room commands.
 - `Engine.Scripter.Start(name)` accepts only an exact `.lua` filename returned by `Engine.Scripter.GetAvailableScripts()`. It cannot execute source strings or disable the sandbox.
+- `Engine.Scripter.GetOutput(name)` returns the current or most recently archived Runtime Workspace output for that exact script filename. It is read-only and returns an empty string when no output is available.
 - A running script must call `Engine.Scripter.StopSelf()` to unload itself. Self-restart is intentionally unavailable; another script may call `Restart(name)`.
 - `Engine.HUD` element operations retain per-script ownership. A script cannot mutate or remove another script's HUD elements.
+- `Engine.Walker.Defer(timeoutMs)` returns an owner-bound decision token. Finish it with `CompleteDeferred(token)`; invalid, expired, or cross-script tokens are rejected.
+- `Engine.Lure.UpdateSetting(index, setting)` updates a 1-based setting through native parsing/validation; tables returned by `GetSettings()` are still detached copies.
 - `Engine.Delays.SetServerPingCheckEnabled()` also applies the required game ping-check interval change.
 - Internal services such as the object dumper, packet/event dispatcher, use-item queue, and Validus networking are not exposed through `Engine`.
 
@@ -1157,6 +1638,7 @@ The exact signatures below are authoritative. Avoid legacy generic update-table 
 Generated from `docs/Scripts/core`. It intentionally excludes local helpers, compatibility aliases, raw bindings, protocol details, and API-surface bootstrap internals. Use the canonical names below; if a function is absent, treat it as unavailable.
 
 ### cavebot.lua
+- `Cavebot.Defer(timeoutMs)`
 - `Cavebot.Disable()`
 - `Cavebot.DisableLure()`
 - `Cavebot.Enable()`
@@ -1164,6 +1646,8 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.GetStatus()`
 - `Cavebot.GoTo(labelName)`
 - `Cavebot.GoToLabel(labelName)`
+- `Cavebot.InterceptAction(callback)`
+- `Cavebot.InterceptLabel(callback)`
 - `Cavebot.IsEnabled()`
 - `Cavebot.IsLureEnabled()`
 - `Cavebot.Lure.AddSetting(setting)`
@@ -1205,7 +1689,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Lure.SetUnblocking(enabled)`
 - `Cavebot.Lure.SetWaypointDynamicLureActive(enabled)`
 - `Cavebot.Lure.UpdateSetting(index, updateData)`
+- `Cavebot.ObserveAction(callback)`
+- `Cavebot.ObserveLabel(callback)`
+- `Cavebot.ObserveWaypointChange(callback)`
 - `Cavebot.OnAction(callback)`
+- `Cavebot.OnActionCompleted(callback)`
+- `Cavebot.OnActionStarted(callback)`
 - `Cavebot.OnLabel(callback)`
 - `Cavebot.OnWaypointChange(callback)`
 - `Cavebot.Pause(milliseconds, autoResume)`
@@ -1218,6 +1707,8 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.UnregisterAllEvents()`
 - `Cavebot.Walker.AddWaypoint(waypoint)`
 - `Cavebot.Walker.ClearWaypoints()`
+- `Cavebot.Walker.CompleteDeferred(token)`
+- `Cavebot.Walker.Defer(timeoutMs)`
 - `Cavebot.Walker.DeleteWaypoint(index)`
 - `Cavebot.Walker.GetAutoRecorderEnabled()`
 - `Cavebot.Walker.GetAutoRecorderOptions()`
@@ -1253,6 +1744,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Walker.SetSelectedWaypointIndex(index)`
 - `Cavebot.Walker.SetStartFromNearestWaypoint(enabled)`
 - `Cavebot.Walker.SetWalkToLureCenter(enabled)`
+- `Cavebot.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
 
 ### cavebot_actions.lua
 - `Cavebot.Actions.GetLastResult()`
@@ -1586,7 +2078,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Delays.SetWalkerWalkDelay(value: integer) -> boolean`
 - `Engine.Equipment.CanMove() -> boolean`
 - `Engine.Equipment.CanRead() -> boolean`
-- `Engine.Equipment.Equip(itemId: integer, tierLevel: integer|nil) -> boolean`
+- `Engine.Equipment.Equip(itemId: integer, tierLevel?: integer) -> boolean`
 - `Engine.Equipment.GetAllSlotItems() -> table`
 - `Engine.Equipment.GetSlotConstants() -> table`
 - `Engine.Equipment.GetSlotIds() -> integer[]`
@@ -1675,7 +2167,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Extras.StartTraining() -> boolean`
 - `Engine.Extras.StopTraining() -> boolean`
 - `Engine.Features.Disable(featureIdentifier: integer|string) -> nil`
-- `Engine.Features.DisableAllExcept(excludeList: table|nil) -> nil`
+- `Engine.Features.DisableAllExcept(excludeList?: table) -> nil`
 - `Engine.Features.DisableMultiple(featureList: table) -> nil`
 - `Engine.Features.Enable(featureIdentifier: integer|string) -> nil`
 - `Engine.Features.EnableMultiple(featureList: table) -> nil`
@@ -1686,27 +2178,27 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Features.PrintStatus() -> nil`
 - `Engine.Features.SetActive(featureIdentifier: integer|string, activeStatus: boolean) -> nil`
 - `Engine.Features.Toggle(featureIdentifier: integer|string) -> nil`
-- `Engine.Healer.AddItem(itemData: table) -> nil`
-- `Engine.Healer.AddSpell(spellData: table) -> nil`
+- `Engine.Healer.AddItem(itemData: table) -> number`
+- `Engine.Healer.AddSpell(spellData: table) -> number`
 - `Engine.Healer.ClearAllItems() -> nil`
 - `Engine.Healer.ClearAllSpells() -> nil`
 - `Engine.Healer.DisableAllItems() -> nil`
 - `Engine.Healer.DisableAllSpells() -> nil`
 - `Engine.Healer.DisableItem(index: number) -> boolean`
-- `Engine.Healer.DisableSpell(index: integer) -> nil`
+- `Engine.Healer.DisableSpell(index: number) -> boolean`
 - `Engine.Healer.EnableItem(index: number) -> boolean`
 - `Engine.Healer.EnableOnlyItems(itemIdsList: table) -> nil`
 - `Engine.Healer.EnableOnlySpells(spellWordsList: table) -> number`
-- `Engine.Healer.EnableSpell(index: integer) -> nil`
-- `Engine.Healer.FindItemById(itemId: integer) -> table|nil`
+- `Engine.Healer.EnableSpell(index: number) -> boolean`
+- `Engine.Healer.FindItemById(itemId: number) -> table|nil`
 - `Engine.Healer.FindSpellByWords(spellWords: string) -> table|nil`
 - `Engine.Healer.GetItems() -> table`
-- `Engine.Healer.GetSpellByIndex(index: integer) -> table|nil`
+- `Engine.Healer.GetSpellByIndex(index: number) -> table|nil`
 - `Engine.Healer.GetSpells() -> table`
 - `Engine.Healer.PrintItems() -> nil`
 - `Engine.Healer.PrintSpells() -> nil`
-- `Engine.Healer.RemoveItem(index: integer) -> nil`
-- `Engine.Healer.RemoveSpell(index: integer) -> nil`
+- `Engine.Healer.RemoveItem(index: number) -> boolean`
+- `Engine.Healer.RemoveSpell(index: number) -> boolean`
 - `Engine.Healer.SetItemAction(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemAttribute(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemCastValue(entryIndex: integer, value: integer) -> boolean`
@@ -1722,7 +2214,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Healer.SetSpellManaCost(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetSpellWords(entryIndex: integer, value: string) -> boolean`
 - `Engine.Healer.ToggleItem(index: number) -> boolean`
-- `Engine.Healer.ToggleSpell(index: integer) -> nil`
+- `Engine.Healer.ToggleSpell(index: number) -> boolean|nil`
 - `Engine.HealFriend.GetArea() -> table`
 - `Engine.HealFriend.GetMode() -> integer`
 - `Engine.HealFriend.GetPlayerNames() -> string`
@@ -1778,7 +2270,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.HUD.SetClickable(id: string, clickable: boolean, callback: function|nil) -> nil`
 - `Engine.HUD.SetDraggable(id: string, draggable: boolean) -> nil`
 - `Engine.HUD.SetDragTarget(id: string, targetId: string|nil) -> nil`
-- `Engine.HUD.SetEnabled(value: boolean) -> boolean`
+- `Engine.HUD.SetEnabled(elementId: string, enabled: boolean) -> nil`
 - `Engine.HUD.SetLevelSpyEnabled(value: boolean) -> boolean`
 - `Engine.HUD.SetMagicWallIds(value: integer[]) -> boolean`
 - `Engine.HUD.SetMagicWallTimersEnabled(value: boolean) -> boolean`
@@ -1847,47 +2339,61 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Lure.SetStartEndLureActive() -> any`
 - `Engine.Lure.SetUnblocking() -> any`
 - `Engine.Lure.SetWaypointDynamicLureActive() -> any`
+- `Engine.Lure.UpdateSetting() -> any`
 - `Engine.MagicShooter.GetActiveProfile() -> table|nil`
 - `Engine.MagicShooter.GetCurrentProfile() -> table|nil`
-- `Engine.MagicShooter.GetEntries(profile: integer|string|nil) -> table[]|nil, string|nil`
+- `Engine.MagicShooter.GetEntries(profile?: integer|string) -> table[]|nil, string|nil`
 - `Engine.MagicShooter.GetProfileCount() -> integer`
 - `Engine.MagicShooter.GetProfileNames() -> string[]`
 - `Engine.MagicShooter.NextProfile() -> table|nil`
 - `Engine.MagicShooter.SetActiveProfile(profile: integer|string) -> boolean`
 - `Engine.MagicShooter.SetCurrentProfile(profile: integer|string) -> boolean`
-- `Engine.MagicShooter.SetEntryAttackSkillBuffSpell(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryCastMethod(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryCondition(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryCustomDelay(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryCustomSpell(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryDangerLevel(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryDistanceSkillIncreasePercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryDontCastWhileWalking(entryIndex: integer, value: boolean) -> boolean`
+- `Engine.MagicShooter.SetEntryAttackSkillBuffSpell(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryCastMethod(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryChainJumpRange(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryChainMaxTargets(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryChainSelector(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryCondition(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryCustomDelay(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryCustomSpell(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryDangerLevel(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryDistanceSkillIncreasePercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryDontCastWhileWalking(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryEffectType(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
 - `Engine.MagicShooter.SetEntryEnabled(entryIndex: integer, enabled: boolean, profile: integer|string|nil) -> boolean`
-- `Engine.MagicShooter.SetEntryHarmony(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryHarmonyCondition(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryHealthCondition(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryHealthPercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryManaPercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryMaximumMonsterHealthPercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryMeleeSkillIncreasePercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryMinimumMonsterHealthPercentage(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryMomentumDelay(entryIndex: integer, value: boolean) -> boolean`
-- `Engine.MagicShooter.SetEntryMonsterCount(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryMonsterCountCondition(entryIndex: integer, value: integer) -> boolean`
+- `Engine.MagicShooter.SetEntryEquipmentRequirement(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryForceUnknownStance(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryHarmony(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryHarmonyCondition(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryHealthCondition(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryHealthPercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryHitCountMode(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryManaPercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMaximumMonsterHealthPercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMeleeSkillIncreasePercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMinimumMonsterHealthPercentage(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMomentumDelay(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMonsterCount(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryMonsterCountCondition(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
 - `Engine.MagicShooter.SetEntryMonsterNames(entryIndex: integer, names: string, profile: integer|string|nil) -> boolean`
-- `Engine.MagicShooter.SetEntryOption(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryPatternAnchor(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryPatternSource(entryIndex: integer, value: string) -> boolean`
-- `Engine.MagicShooter.SetEntryPatternVariant(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryPrioritizeWithMomentum(entryIndex: integer, value: boolean) -> boolean`
-- `Engine.MagicShooter.SetEntryPVPSafe(entryIndex: integer, value: boolean) -> boolean`
+- `Engine.MagicShooter.SetEntryOption(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPatternAnchor(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPatternId(entryIndex: integer, patternId: string, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPatternSource(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPatternVariant(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPrioritizeWithMomentum(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPriorityLane(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryPVPSafe(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
 - `Engine.MagicShooter.SetEntryRange(entryIndex: integer, range: integer, profile: integer|string|nil) -> boolean`
-- `Engine.MagicShooter.SetEntryRequiresTarget(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryRune(entryIndex: integer, runeId: integer, profile: integer|string|nil) -> boolean, string|nil`
-- `Engine.MagicShooter.SetEntryShootAfterWalkDelay(entryIndex: integer, value: integer) -> boolean`
-- `Engine.MagicShooter.SetEntryShootOverAllies(entryIndex: integer, value: boolean) -> boolean`
-- `Engine.MagicShooter.SetEntrySpell(entryIndex: integer, spellWords: string, profile: integer|string|nil) -> boolean, string|nil`
+- `Engine.MagicShooter.SetEntryRequiresTarget(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryRune(entryIndex: integer, runeId: integer, profile?: integer|string) -> boolean, string|nil`
+- `Engine.MagicShooter.SetEntryShootAfterWalkDelay(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryShootOverAllies(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntrySpell(entryIndex: integer, spellWords: string, profile?: integer|string) -> boolean, string|nil`
+- `Engine.MagicShooter.SetEntryStanceGroup(entryIndex: integer, value: string, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryStanceId(entryIndex: integer, value: string, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryTargetPolicy(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
+- `Engine.MagicShooter.SetEntryTrackedEffect(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
 - `Engine.PVPTools.GetConfig() -> table`
 - `Engine.PVPTools.IsAntiPushEnabled() -> boolean`
 - `Engine.PVPTools.IsHoldTargetEnabled() -> boolean`
@@ -1916,6 +2422,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.PVPTools.ToggleHoldTarget() -> boolean`
 - `Engine.Scripter.GetAutoStartEnabled() -> boolean`
 - `Engine.Scripter.GetAvailableScripts() -> table[]`
+- `Engine.Scripter.GetOutput(scriptName: string) -> string`
 - `Engine.Scripter.GetRunningScripts() -> table[]`
 - `Engine.Scripter.IsRunning(scriptName: string) -> boolean`
 - `Engine.Scripter.Refresh() -> boolean`
@@ -1997,6 +2504,8 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.TimerActions.SetEntryUseInProtectionZone(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.Walker.AddWaypoint() -> any`
 - `Engine.Walker.ClearWaypoints() -> any`
+- `Engine.Walker.CompleteDeferred(token: integer) -> boolean`
+- `Engine.Walker.Defer(timeoutMs: integer) -> integer`
 - `Engine.Walker.DeleteWaypoint() -> any`
 - `Engine.Walker.GetAutoRecorderEnabled() -> any`
 - `Engine.Walker.GetAutoRecorderOptions() -> any`
@@ -2032,6 +2541,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Walker.SetSelectedWaypointIndex() -> any`
 - `Engine.Walker.SetStartFromNearestWaypoint() -> any`
 - `Engine.Walker.SetWalkToLureCenter() -> any`
+- `Engine.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
 
 ### event_proxies.lua
 - `BattleMessageProxy:GetName() -> string`
@@ -2094,18 +2604,18 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `BotFeatureId.TARGETING = 6`
 - `BotFeatureId.TIMER_ACTIONS = 18`
 - `BotFeatureId.WALKER = 5`
-- `Features.Disable(featureIdentifier)`
+- `Features.Disable(featureIdentifier: integer|string) -> boolean`
 - `Features.DisableAllExcept(ExcludeList)`
 - `Features.DisableMultiple(featureList)`
-- `Features.Enable(featureIdentifier)`
+- `Features.Enable(featureIdentifier: integer|string) -> boolean`
 - `Features.EnableMultiple(featureList)`
 - `Features.GetActiveFeatures()`
 - `Features.GetAllFeatureIds()`
 - `Features.GetName(featureIdentifier)`
 - `Features.IsActive(featureIdentifier)`
 - `Features.PrintStatus()`
-- `Features.SetActive(featureIdentifier, activeStatus)`
-- `Features.Toggle(featureIdentifier)`
+- `Features.SetActive(featureIdentifier: integer|string, activeStatus: boolean) -> boolean`
+- `Features.Toggle(featureIdentifier: integer|string) -> boolean`
 
 ### game.lua
 - `Game.EnterWorld() -> boolean`
@@ -2119,7 +2629,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 
 ### hotkeys.lua
 - `Hotkeys.ParseCombo(combination: string) -> table|nil, string|nil`
-- `Hotkeys.RegisterCombo(params: table) -> boolean`
+- `Hotkeys.RegisterCombo(params: table) -> boolean, string`
 - `Hotkeys.SendCombo(combination: string, clientOnly?: boolean) -> boolean`
 - `Hotkeys.SendKey(key: string|integer, clientOnly?: boolean) -> boolean`
 
@@ -2154,9 +2664,9 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ScreenImage:SetRenderLayer(renderLayer: string) -> ScreenImage`
 - `ScreenImage:SetScreenPosition(x: number, y: number) -> ScreenImage`
 - `ScreenImage:SetSize(width, height)`
-- `ScreenImage:SetSource(path)`
-- `ScreenImage:SetSourceBase64(base64Png: string) -> ScreenImage`
-- `ScreenImage:SetSourceBytes(pngBytes: number[]) -> ScreenImage`
+- `ScreenImage:SetSource(path: string) -> ScreenImage`
+- `ScreenImage:SetSourceBase64(base64Image: string) -> ScreenImage`
+- `ScreenImage:SetSourceBytes(imageBytes: number[]|string) -> ScreenImage`
 - `ScreenImage:SetZIndex(zIndex)`
 - `ScreenText:ClearParent() -> ScreenText`
 - `ScreenText:Create() -> ScreenText`
@@ -2228,9 +2738,9 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WorldImage:SetPosition(x, y, z)`
 - `WorldImage:SetRenderLayer(renderLayer: string) -> WorldImage`
 - `WorldImage:SetSize(width, height)`
-- `WorldImage:SetSource(path)`
-- `WorldImage:SetSourceBase64(base64Png: string) -> WorldImage`
-- `WorldImage:SetSourceBytes(pngBytes: number[]) -> WorldImage`
+- `WorldImage:SetSource(path: string) -> WorldImage`
+- `WorldImage:SetSourceBase64(base64Image: string) -> WorldImage`
+- `WorldImage:SetSourceBytes(imageBytes: number[]|string) -> WorldImage`
 - `WorldImage:SetZIndex(zIndex)`
 - `WorldText:ClearParent() -> WorldText`
 - `WorldText:Create() -> WorldText`
@@ -2536,6 +3046,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Vocation.VOCATION_MONK_CIP = 5`
 - `Vocation.VOCATION_PALADIN_CIP = 2`
 - `Vocation.VOCATION_SORCERER_CIP = 3`
+- `WalkerEvent.ACTION_COMPLETED = 6`
+- `WalkerEvent.ACTION_STARTED = 5`
+- `WalkerEvent.OBSERVE_ACTION = 4`
+- `WalkerEvent.OBSERVE_LABEL = 3`
 - `WalkerEvent.ON_ACTION = 2`
 - `WalkerEvent.ON_LABEL = 0`
 - `WalkerEvent.ON_WAYPOINT_CHANGE = 1`
@@ -2562,18 +3076,18 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Minimap.IsWalkableByColor(position: table) -> boolean|nil`
 
 ### module.lua
-- `Module.After(name, callback, delayMs)`
-- `Module.Cancel(name)`
-- `Module.Every(name, callback, delayMs)`
-- `Module.Exists(name)`
-- `Module.Get(name)`
-- `Module.List()`
-- `Module.New(name, callback, delayMs)`
-- `Module.Pause(name)`
-- `Module.PauseManaged(name)`
-- `Module.Resume(name)`
-- `Module.ResumeManaged(name)`
-- `Module.Stop(name)`
+- `Module.After(name: string, callback: function, delayMs: integer) -> boolean`
+- `Module.Cancel(name: string) -> boolean`
+- `Module.Every(name: string, callback: function, delayMs: integer) -> boolean`
+- `Module.Exists(name: string) -> boolean`
+- `Module.Get(name: string) -> table|nil`
+- `Module.List() -> table[]`
+- `Module.New(name: string, callback: function, delayMs?: integer) -> nil`
+- `Module.Pause(name: string) -> nil`
+- `Module.PauseManaged(name: string) -> boolean`
+- `Module.Resume(name: string) -> nil`
+- `Module.ResumeManaged(name: string) -> boolean`
+- `Module.Stop(name: string) -> nil`
 
 ### npc_trade_storage.lua
 - `NpcTradeStorage.Buy(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> any`
@@ -2594,12 +3108,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Position:DistanceTo(otherPos: table|Position) -> integer`
 
 ### self.lua
-- `Self.Attack(creatureId: integer) -> any`
-- `Self.BuyItem(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> any`
-- `Self.CancelWalk() -> any`
-- `Self.Dismount() -> any`
-- `Self.Equip(itemId: integer, tierLevel?: integer) -> any`
-- `Self.Follow(creatureId: integer) -> any`
+- `Self.Attack(creatureId: integer) -> boolean`
+- `Self.BuyItem(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> boolean`
+- `Self.CancelWalk() -> boolean`
+- `Self.Dismount() -> boolean`
+- `Self.Equip(itemId: integer, tierLevel?: integer) -> boolean`
+- `Self.Follow(creatureId: integer) -> boolean`
 - `Self.FormatStatsSnapshot(stats?: table, prefix?: string) -> string`
 - `Self.GetCapacity() -> number|nil`
 - `Self.GetCapacityFloor() -> integer|nil`
@@ -2654,28 +3168,23 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.IsPoisoned() -> boolean|nil`
 - `Self.IsRooted() -> boolean|nil`
 - `Self.IsStrengthened() -> boolean|nil`
-- `Self.LookAtCreature(creatureId: integer) -> any`
-- `Self.LookAtPosition(position: table) -> any`
-- `Self.Mount() -> any`
+- `Self.LookAtCreature(creatureId: integer) -> boolean`
+- `Self.LookAtPosition(position: table) -> boolean`
+- `Self.Mount() -> boolean`
 - `Self.PrivateMessage(playerName: string, message: string) -> boolean`
 - `Self.Say(message: string) -> boolean`
-- `Self.SayOnChannel(message: string, channelId: integer) -> any`
+- `Self.SayOnChannel(message: string, channelId: integer) -> boolean`
 - `Self.SayToNpc(message: string) -> boolean`
-- `Self.SellItem(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> any`
-- `Self.Step(direction: integer) -> any`
-- `Self.StopAttackAndFollow() -> any`
-- `Self.UseItemInContainer(itemId: integer, containerIndex: integer, itemPos: integer, useItemWithHotkey?: boolean) -> any`
-- `Self.UseItemOnFloor(position: table, stackPosition: integer, itemId: integer) -> any`
+- `Self.SellItem(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> boolean`
+- `Self.Step(direction: integer) -> boolean`
+- `Self.StopAttackAndFollow() -> boolean`
+- `Self.UseItemInContainer(itemId: integer, containerIndex: integer, itemPos: integer, useItemWithHotkey?: boolean) -> boolean`
+- `Self.UseItemOnFloor(position: table, stackPosition: integer, itemId: integer) -> boolean`
 - `Self.Whisper(message: string) -> boolean`
 - `Self.Yell(message: string) -> boolean`
 
 ### sound.lua
 - `BotSoundId.CREATURE_DETECTED = 5`
-- `BotSoundId.CUSTOM_SOUND_1 = 14`
-- `BotSoundId.CUSTOM_SOUND_2 = 15`
-- `BotSoundId.CUSTOM_SOUND_3 = 16`
-- `BotSoundId.CUSTOM_SOUND_4 = 17`
-- `BotSoundId.CUSTOM_SOUND_5 = 18`
 - `BotSoundId.DAMAGE_TAKEN = 1`
 - `BotSoundId.DISCONNECTED = 0`
 - `BotSoundId.ENEMY_ON_SCREEN = 9`
@@ -2689,15 +3198,16 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `BotSoundId.SKULL_ON_SCREEN = 8`
 - `BotSoundId.UNJUSTIFIED_KILL = 13`
 - `BotSoundId.WALKER_STUCK = 12`
-- `Sound.ClearQueue() -> boolean`
+- `Sound.ClearQueue()`
 - `Sound.GetCurrentDuration() -> integer`
 - `Sound.GetFileDuration(filePath: string) -> integer`
 - `Sound.GetQueueSize() -> integer`
 - `Sound.IsPlaying() -> boolean`
 - `Sound.IsQueued(options: table) -> boolean`
-- `Sound.Play(options: table) -> boolean`
-- `Sound.SetMinDelay(delayMs: integer) -> boolean`
-- `Sound.Stop() -> boolean`
+- `Sound.Play(options: table)`
+- `Sound.SetMinDelay(delayMs: integer)`
+- `Sound.Stop()`
+- `Time.MonotonicMs() -> integer`
 
 ### spells.lua
 - `Spells.GetGroupIds(spellOrWordsOrId)`
@@ -2721,6 +3231,13 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Spells.WillBeReady(spellOrWordsOrId, timeMs)`
 
 ### storage.lua
+- `SharedStorageScope:Clear() -> boolean, string|nil`
+- `SharedStorageScope:Get(key: string, default?: any) -> any, string|nil`
+- `SharedStorageScope:OffChanged(subscriptionId: string) -> boolean, string|nil`
+- `SharedStorageScope:OnChanged(callback: function, key?: string, includeSelf?: boolean) -> string|nil, string|nil`
+- `SharedStorageScope:Remove(key: string) -> boolean, string|nil`
+- `SharedStorageScope:Set(key: string, value: any) -> boolean, string|nil`
+- `SharedStorageScope:Update(key: string, updater: function, default?: any) -> boolean, any, string|nil`
 - `Storage.Character.Clear() -> boolean`
 - `Storage.Character.Get(key: string, default?: any) -> any`
 - `Storage.Character.Remove(key: string) -> boolean`
@@ -2731,6 +3248,8 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Storage.Global.Remove(key: string) -> boolean`
 - `Storage.Global.Set(key: string, value: any) -> boolean`
 - `Storage.Namespace(namespace: string, perCharacter?: boolean) -> StorageScope`
+- `Storage.Shared(namespace: string) -> SharedStorageScope`
+- `Storage.SharedForCharacter(namespace: string) -> SharedStorageScope`
 - `StorageScope:Get(key: string, default?: any) -> any`
 - `StorageScope:Remove(key: string) -> boolean`
 - `StorageScope:Set(key: string, value: any) -> boolean`
