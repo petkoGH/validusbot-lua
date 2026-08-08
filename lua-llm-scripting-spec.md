@@ -91,9 +91,10 @@ can handle meaningfully, then either recover or rethrow with context.
 - Per script: 64 MiB Lua memory, 256 managed coroutines, 64 pending event
   callbacks, and 32 outstanding async result tokens.
 - Scheduler limits are 3 ms per coroutine resume, 4 ms per script per frame, and
-  8 ms for all Lua work per frame. Yieldable Lua is time-sliced. A single
-  unpreemptable 50 ms overrun, or three consecutive smaller unpreemptable budget
-  overruns, circuit-breaks the offending component.
+  8 ms for all Lua work per frame. Yieldable Lua is time-sliced. Deadline misses
+  remain available as telemetry, while three consecutive unpreempted resumes of
+  at least 5 ms or one unpreempted 50 ms resume circuit-breaks the offending
+  component.
 - Delays are integer milliseconds from 0 through 86,400,000 unless a narrower
   function-specific range is documented.
 
