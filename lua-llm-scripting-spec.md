@@ -154,10 +154,52 @@ can handle meaningfully, then either recover or rethrow with context.
 - Sandboxed `require` loads text-only Lua modules from the allowed script/library
   roots under the same restricted environment. Do not depend on native C-module
   loading or DLL search paths.
+- `Settings.Save`/`Settings.Load` and `Cavebot.Save`/`Cavebot.Load` are the
+  supported profile-file APIs. An explicit path is used exactly once; a bare
+  settings filename is searched beside the running script and then in the
+  product `Settings` folder, while a bare waypoint filename is searched beside
+  the script and then in `Waypoints`. Sandboxed calls remain confined to the
+  script tree and the matching product profile folder. Loads are queued until
+  Lua dispatch has unwound; loading Scripter settings can stop/restart the
+  caller, and loading a waypoint bundle can stop waypoint scripts.
 - Current builds do not export `Game.GetMinimapTilePixelColor`.
   `Minimap.GetTilePixelColor` and `Minimap.IsWalkableByColor` are compatibility
   capability calls and return `nil`; use `Minimap.GetTileFlags`,
   `Minimap.IsWalkable`, or `Map` pathfinding.
+
+## Profile File Save/Load
+
+Use `Engine.Settings.Save/Load` (or the equivalent global `Settings` methods)
+for `.json` settings and `Cavebot.Save/Load` for `.validuswpt` bundles. Each
+returns `true, resolvedPath`; path/queue errors raise a normal Lua error.
+
+```lua
+Engine.Settings.Save("mage.json", {
+    Engine.Settings.Feature.Healer,
+    Engine.Settings.Feature.Targeting,
+    Engine.Settings.Feature.Scripter
+})
+
+Cavebot.Load("hunt.validuswpt", {
+    Cavebot.BundleFeature.Targeting,
+    Cavebot.BundleFeature.Looter
+})
+```
+
+For settings, `features == nil` selects all 19 GUI feature sections. An empty
+table selects none; `{ all = true, scripter = false }` selects all except
+Scripter. Key Events are always saved/loaded. For waypoint bundles, Walker and
+Lure are always included and the optional table selects Targeting, Magic
+Shooter, and Looter; `nil` selects none of those optional sections.
+
+A bare load name checks the running script's directory first and the matching
+product `Settings`/`Waypoints` folder second. A path containing directories is
+used only at that script-relative location; an absolute path is used only as
+given. Missing files report every searched location. Bare saves target the
+running script's directory (or the matching product folder for an embedded
+script). The Lua sandbox still confines profile access to `Scripts` and the
+matching product folder; disabling it permits other local paths, but network,
+UNC, device, and mapped-remote paths remain rejected.
 
 ## Critical Constants (Explicit Values)
 Use these exact values to avoid numeric mapping mistakes.
@@ -641,6 +683,14 @@ Primary API:
 - Map.GetObjectInfo(itemId)
 - Map.FindPath(fromPosition, toPosition, maxComplexity, flags)
 
+`Map.FindPath` preserves the legacy path topology. It rejects a visible teleport
+as an intermediate node, but permits one when it is the exact requested goal.
+For scripted one-step movement, inspect `Map.GetTileFlags(next).hasTeleport` and
+the `isFloorChange` / `isTeleport` fields returned by `Map.GetTileItems(next)`;
+then treat `Self.Step(...) == true` only as dispatch acceptance and confirm that
+the observed player position reached the expected same-floor tile before consuming
+the path direction. Replan on timeout or any unexpected/floor-changing position.
+
 ### minimap.lua
 Read-only minimap tile queries and pathfinding helpers.
 
@@ -844,6 +894,7 @@ Primary namespaces:
 - Engine.HUD
 - Engine.Scripter
 - Engine.Delays
+- Engine.Settings (canonical profile-file API; global `Settings` is equivalent)
 
 Use `Engine.Features` to query, enable, disable, or toggle public bot features, including Supplies Sorter. IDs for internal object dumping, queue/event infrastructure, and the scripter are rejected by the native boundary. `Engine.Equipment` provides live equipped-slot data and equipment actions; it is distinct from Equipment Manager's saved configuration. Magic Shooter and Targeting expose profile and explicit entry control.
 
@@ -862,6 +913,8 @@ setting using native validation.
 High-level cavebot orchestration wrappers over Walker and Lure Manager feature toggles.
 
 Primary API:
+- Cavebot.Save(path, features?)
+- Cavebot.Load(path, features?)
 - Cavebot.SetEnabled(enabled)
 - Cavebot.Enable()
 - Cavebot.Disable()
@@ -942,6 +995,14 @@ Walker namespace (full runtime wrappers):
 - Cavebot.Walker.SelectClosestWaypoint()
 - Cavebot.Walker.GetWaypointCount()
 - Cavebot.Walker.GetWaypoints()
+- Cavebot.Walker.GetSpecialAreas()
+- Cavebot.Walker.GetSpecialAreaCount()
+- Cavebot.Walker.AddSpecialArea(area)
+- Cavebot.Walker.UpdateSpecialArea(id, updateData)
+- Cavebot.Walker.DeleteSpecialArea(id)
+- Cavebot.Walker.ClearSpecialAreas()
+- Cavebot.Walker.ReorderSpecialArea(sourceIndex, targetIndex, dropAfterTarget?)
+- Cavebot.Walker.IsPositionInsideSpecialArea(x, y, z, featureMask)
 - Cavebot.Walker.AddWaypoint(waypoint)
 - Cavebot.Walker.InsertWaypoint(index, waypoint)
 - Cavebot.Walker.ReplaceWaypoint(index, waypoint)
@@ -962,6 +1023,20 @@ Walker namespace (full runtime wrappers):
 - Cavebot.Walker.GetLeaveLurePlayerMode()
 - Cavebot.Walker.SetDebugHud(enabled)
 - Cavebot.Walker.GetDebugHud()
+- Cavebot.Walker.SetNavigationMode(mode)
+- Cavebot.Walker.GetNavigationMode()
+- Cavebot.Walker.SetAutoExploreSettings(settings)
+- Cavebot.Walker.GetAutoExploreSettings()
+- Cavebot.Walker.ResetAutoExploreCoverage()
+- Cavebot.Walker.GetAutoExploreStatus()
+- Cavebot.Walker.IsAutoExplorePositionPainted(x, y, z)
+- Cavebot.Walker.GetAutoExploreConnectors()
+- Cavebot.Walker.AddAutoExploreConnector(connector)
+- Cavebot.Walker.UpdateAutoExploreConnector(id, updateData)
+- Cavebot.Walker.DeleteAutoExploreConnector(id)
+- Cavebot.Walker.ClearAutoExploreConnectors()
+- Cavebot.Walker.SetAutoExploreConnectorRecording(enabled)
+- Cavebot.Walker.GetAutoExploreConnectorRecording()
 - Cavebot.Walker.SetAutoRecorderEnabled(enabled)
 - Cavebot.Walker.GetAutoRecorderEnabled()
 - Cavebot.Walker.SetAutoRecorderOptions(options)
@@ -974,6 +1049,34 @@ Walker namespace (full runtime wrappers):
 Leave-lure player detection modes:
 - `Cavebot.Walker.LeaveLurePlayerMode.NonAllyPlayers` (`0`, default) ignores party and guild/allied-guild players.
 - `Cavebot.Walker.LeaveLurePlayerMode.AnyPlayer` (`1`) reacts to every visible player other than the local character.
+
+Special Area records are detached snapshots with `index`, stable `id` and
+`uniqueId`, `x`, `y`, `z`, `width`, `height`, `featureMask`, and `enabled`.
+Adding requires `x`, `y`, and `z`; width and height default to 1 and are limited
+to 1 through 10. Coordinates `x` and `y` must be 1 through 65535 and `z` must
+be 0 through 15. `featureMask` defaults to Walker (`1`) and `enabled` defaults
+to `true`. The feature mask values are available through
+`Cavebot.Walker.SpecialAreaFeature` and `Engine.Walker.SpecialAreaFeature`:
+Walker `1`, Targeting `2`, MagicShooter `4`, Looter `8`, and All `15`. Masks may
+be combined. Update and delete use the stable ID, not the mutable row index;
+updates are partial and preserve omitted fields. Every successful geometry or
+scope mutation invalidates Walker's cached movement and refreshes its HUD.
+
+Auto Explore navigation mode is `"waypoints"` or `"auto_explore"`, and can be
+changed only while Walker is stopped. Styles are `"natural"`, `"thorough"`,
+and `"wide_roam"`. Settings updates are partial and use
+`maximumFloorsUp`, `maximumFloorsDown`, `allowWalkOn`, `allowLadder`,
+`allowRope`, `allowHole`, `allowTeleport`, and `autoOpenDoors`. Painted areas
+are intentionally edited only through World Map; scripts can query containment
+with `IsAutoExplorePositionPainted`. Connector records use stable IDs, one of
+`walk_on`, `ladder`, `rope`, `hole`, or `teleport`, and explicit
+`source={x,y,z}` / `destination={x,y,z}` positions. Runtime status is a detached
+snapshot containing phase, base/current/target positions, plannedPath,
+recentTrail, bounded `recentVisitHeat` samples, coverage counts,
+activeConnectorId, outsideMask, status, and `latestFailureReason`. Pairing uses
+two reciprocal directed records; updating one paired record mirrors only its
+endpoints onto the reverse record, while deleting one leaves the reverse record
+valid and unpaired.
 
 Waypoint script note:
 - Script waypoints should call `Cavebot.Walker.Resume()` when they are done.
@@ -1033,6 +1136,14 @@ Lure namespace (full runtime wrappers):
 - Cavebot.Lure.GetSlowWalkingCreaturesCount()
 - Cavebot.Lure.SetSlowWalkBurstSteps(steps)
 - Cavebot.Lure.GetSlowWalkBurstSteps()
+- Cavebot.Lure.SetKitingPreferredFarthestDistance(distance)
+- Cavebot.Lure.GetKitingPreferredFarthestDistance()
+- Cavebot.Lure.SetKitingMaximumFarthestDistance(distance)
+- Cavebot.Lure.GetKitingMaximumFarthestDistance()
+- Cavebot.Lure.SetKitingCloseMonsterDistance(distance)
+- Cavebot.Lure.GetKitingCloseMonsterDistance()
+- Cavebot.Lure.SetKitingCloseMonsterCount(count)
+- Cavebot.Lure.GetKitingCloseMonsterCount()
 - Cavebot.Lure.SetIgnoringMonsters(enabled)
 - Cavebot.Lure.GetIgnoringMonsters()
 - Cavebot.Lure.SetStartEndLureActive(enabled)
@@ -1050,6 +1161,12 @@ Lure namespace (full runtime wrappers):
 - Cavebot.Lure.UpdateSetting(index, updateData)
 - Cavebot.Lure.RemoveSetting(index)
 - Cavebot.Lure.ClearSettings()
+
+Kiting preferred, maximum, and close-monster distances accept integers from 1
+through 7. Preferred may not exceed the current maximum, and maximum may not be
+below the current preferred value, so adjust them in a valid order when changing
+both. Close-monster count accepts 0 through 200. These getters/setters edit the
+same values persisted by Lure Settings.
 
 ### sound.lua
 Sound playback and queue control.
@@ -1074,16 +1191,25 @@ Primary API:
 - Sound.PlayByIdSmart(soundId, instant?)
 - Sound.PlayByNameSmart(soundName, instant?)
 - Sound.PlayFileSmart(filePath, instant?)
-- Sound.PlayBotSound(nameOrWavFilename, instant?)
+- Sound.PlayBotSound(nameOrPath, instant?)
 
 `Sound.Play` and `Sound.IsQueued` options must identify exactly one source:
 `sound_id = BotSoundId.*`, `sound_name = string`, or `file_path = string`.
 `Sound.Play` also accepts `instant = boolean`. Built-in IDs are exactly 0 through
 13 (`DISCONNECTED` through `UNJUSTIFIED_KILL`); there are no custom IDs 14
-through 18. `PlayBotSound` resolves a canonical built-in name and strips an
-optional `.wav` suffix. For an arbitrary WAV file, pass its explicit absolute
-path to `PlayFile` or `Sound.Play({ file_path = ... })`; do not construct an old
-Documents/ValidusBot alarm path.
+through 18. A bare `sound_name` such as `raid_warning` or `raid_warning.wav`
+first searches the product `Data/Alarms` folder and then the calling script's
+folder. Only bare filenames are accepted for lookup; subdirectories and
+traversal are rejected. A fully qualified path supplied as `sound_name` is used
+directly, while `file_path` always requires a full absolute file path and never
+falls back to either folder. `PlayBotSound` accepts the same name-or-full-path
+forms without rewriting the value. Missing files and invalid WAV data raise a
+Lua error synchronously. `Sound.IsQueued` uses the identical resolver, so its
+answer matches the request identity queued by `Sound.Play`. Scripts created
+from embedded strings have no script-folder fallback because they have no
+owning file path. Historical aliases such as `health` and `pm` are resolved
+only after exact filename lookup in both folders; the alias succeeds only when
+its canonical packaged alarm WAV exists and passes validation.
 
 Playback, queue state, and stop/cleanup are owner-scoped, so one script cannot
 claim another script's playback as its own. `SetMinDelay` changes the shared
@@ -1657,6 +1783,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Lure.GetAttackWhileLuring()`
 - `Cavebot.Lure.GetConsiderOnlyReachable()`
 - `Cavebot.Lure.GetIgnoringMonsters()`
+- `Cavebot.Lure.GetKitingCloseMonsterCount() -> integer`
+- `Cavebot.Lure.GetKitingCloseMonsterDistance() -> integer`
+- `Cavebot.Lure.GetKitingMaximumFarthestDistance() -> integer`
+- `Cavebot.Lure.GetKitingPreferredFarthestDistance() -> integer`
 - `Cavebot.Lure.GetLuredCreaturesCount()`
 - `Cavebot.Lure.GetNearRange()`
 - `Cavebot.Lure.GetOption()`
@@ -1681,6 +1811,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Lure.SetEnabled(enabled)`
 - `Cavebot.Lure.SetForceLure(enabled)`
 - `Cavebot.Lure.SetIgnoringMonsters(enabled)`
+- `Cavebot.Lure.SetKitingCloseMonsterCount(count: integer) -> boolean`
+- `Cavebot.Lure.SetKitingCloseMonsterDistance(distance: integer) -> boolean`
+- `Cavebot.Lure.SetKitingMaximumFarthestDistance(distance: integer) -> boolean`
+- `Cavebot.Lure.SetKitingPreferredFarthestDistance(distance: integer) -> boolean`
 - `Cavebot.Lure.SetNearRange(range)`
 - `Cavebot.Lure.SetOption(option)`
 - `Cavebot.Lure.SetSlowWalkBurstSteps(steps)`
@@ -1706,19 +1840,29 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.SetEnginesEnabled(walkerEnabled, lureEnabled)`
 - `Cavebot.SetLureEnabled(enabled)`
 - `Cavebot.UnregisterAllEvents()`
+- `Cavebot.Walker.AddSpecialArea(area: table) -> integer|string|false`
 - `Cavebot.Walker.AddWaypoint(waypoint)`
+- `Cavebot.Walker.ClearSpecialAreas() -> boolean`
 - `Cavebot.Walker.ClearWaypoints()`
 - `Cavebot.Walker.CompleteDeferred(token)`
 - `Cavebot.Walker.Defer(timeoutMs)`
+- `Cavebot.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
 - `Cavebot.Walker.DeleteWaypoint(index)`
 - `Cavebot.Walker.GetAutoRecorderEnabled()`
 - `Cavebot.Walker.GetAutoRecorderOptions()`
+- `Cavebot.Walker.GetAutoExploreConnectorRecording() -> boolean`
+- `Cavebot.Walker.GetAutoExploreConnectors() -> table[]`
+- `Cavebot.Walker.GetAutoExploreSettings() -> table`
+- `Cavebot.Walker.GetAutoExploreStatus() -> table`
+- `Cavebot.Walker.GetNavigationMode() -> string`
 - `Cavebot.Walker.GetDebugHud()`
 - `Cavebot.Walker.GetDistanceBetweenWaypoints()`
 - `Cavebot.Walker.GetLeaveLureOnPlayer()`
 - `Cavebot.Walker.GetLeaveLurePlayerMode() -> integer`
 - `Cavebot.Walker.GetNodeDistance()`
 - `Cavebot.Walker.GetSelectedWaypointIndex()`
+- `Cavebot.Walker.GetSpecialAreaCount() -> integer`
+- `Cavebot.Walker.GetSpecialAreas() -> table[]`
 - `Cavebot.Walker.GetStartFromNearestWaypoint()`
 - `Cavebot.Walker.GetWalkToLureCenter()`
 - `Cavebot.Walker.GetWaypointCount()`
@@ -1727,14 +1871,25 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Walker.InsertWaypoint(index, waypoint)`
 - `Cavebot.Walker.IsEnabled()`
 - `Cavebot.Walker.IsPausedByLua()`
+- `Cavebot.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
+- `Cavebot.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
 - `Cavebot.Walker.IsStuck()`
 - `Cavebot.Walker.MoveWaypointDown(index)`
 - `Cavebot.Walker.MoveWaypointUp(index)`
+- `Cavebot.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
 - `Cavebot.Walker.ReplaceWaypoint(index, waypoint)`
 - `Cavebot.Walker.Resume()`
 - `Cavebot.Walker.SelectClosestWaypoint()`
 - `Cavebot.Walker.SetAutoRecorderEnabled(enabled)`
 - `Cavebot.Walker.SetAutoRecorderOptions(options)`
+- `Cavebot.Walker.AddAutoExploreConnector(connector: table) -> integer|string|false`
+- `Cavebot.Walker.ClearAutoExploreConnectors() -> boolean`
+- `Cavebot.Walker.DeleteAutoExploreConnector(id: integer|string) -> boolean`
+- `Cavebot.Walker.ResetAutoExploreCoverage() -> boolean`
+- `Cavebot.Walker.SetAutoExploreConnectorRecording(enabled: boolean) -> boolean`
+- `Cavebot.Walker.SetAutoExploreSettings(settings: table) -> boolean`
+- `Cavebot.Walker.SetNavigationMode(mode: string) -> boolean`
+- `Cavebot.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: table) -> boolean`
 - `Cavebot.Walker.SetDebugHud(enabled)`
 - `Cavebot.Walker.SetDistanceBetweenWaypoints(distance)`
 - `Cavebot.Walker.SetEnabled(enabled)`
@@ -1746,6 +1901,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cavebot.Walker.SetStartFromNearestWaypoint(enabled)`
 - `Cavebot.Walker.SetWalkToLureCenter(enabled)`
 - `Cavebot.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
+- `Cavebot.Walker.UpdateSpecialArea(id: integer|string, updateData: table) -> boolean`
 
 ### cavebot_actions.lua
 - `Cavebot.Actions.GetLastResult()`
@@ -1918,7 +2074,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Alarms.SetFlashWindowEnabled(value: boolean) -> boolean`
 - `Engine.Alarms.SetGmChatCheckEnabled(value: boolean) -> boolean`
 - `Engine.Alarms.SetGmNames(value: string) -> boolean`
-- `Engine.Alarms.SetIgnoreAllyPlayers(ignore: boolean) -> boolean`
+- `Engine.Alarms.SetIgnoreAllyPlayers(ignore: any) -> boolean`
 - `Engine.Alarms.SetLowHealthPercentage(arg1: any) -> boolean`
 - `Engine.Alarms.SetLowHealthThreshold(percentage: number) -> boolean`
 - `Engine.Alarms.SetLowManaPercentage(arg1: any) -> boolean`
@@ -2308,6 +2464,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Lure.GetAttackWhileLuring() -> any`
 - `Engine.Lure.GetConsiderOnlyReachable() -> any`
 - `Engine.Lure.GetIgnoringMonsters() -> any`
+- `Engine.Lure.GetKitingCloseMonsterCount() -> integer`
+- `Engine.Lure.GetKitingCloseMonsterDistance() -> integer`
+- `Engine.Lure.GetKitingMaximumFarthestDistance() -> integer`
+- `Engine.Lure.GetKitingPreferredFarthestDistance() -> integer`
 - `Engine.Lure.GetLuredCreaturesCount() -> any`
 - `Engine.Lure.GetNearRange() -> any`
 - `Engine.Lure.GetOption() -> any`
@@ -2332,6 +2492,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Lure.SetEnabled() -> any`
 - `Engine.Lure.SetForceLure() -> any`
 - `Engine.Lure.SetIgnoringMonsters() -> any`
+- `Engine.Lure.SetKitingCloseMonsterCount(count: integer) -> boolean`
+- `Engine.Lure.SetKitingCloseMonsterDistance(distance: integer) -> boolean`
+- `Engine.Lure.SetKitingMaximumFarthestDistance(distance: integer) -> boolean`
+- `Engine.Lure.SetKitingPreferredFarthestDistance(distance: integer) -> boolean`
 - `Engine.Lure.SetNearRange() -> any`
 - `Engine.Lure.SetOption() -> any`
 - `Engine.Lure.SetSlowWalkBurstSteps() -> any`
@@ -2503,19 +2667,29 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.TimerActions.SetEntrySpellWords(entryIndex: integer, value: string) -> boolean`
 - `Engine.TimerActions.SetEntryType(entryIndex: integer, value: integer) -> boolean`
 - `Engine.TimerActions.SetEntryUseInProtectionZone(entryIndex: integer, value: boolean) -> boolean`
+- `Engine.Walker.AddSpecialArea(area: table) -> integer|string|false`
 - `Engine.Walker.AddWaypoint() -> any`
+- `Engine.Walker.ClearSpecialAreas() -> boolean`
 - `Engine.Walker.ClearWaypoints() -> any`
 - `Engine.Walker.CompleteDeferred(token: integer) -> boolean`
 - `Engine.Walker.Defer(timeoutMs: integer) -> integer`
+- `Engine.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
 - `Engine.Walker.DeleteWaypoint() -> any`
 - `Engine.Walker.GetAutoRecorderEnabled() -> any`
 - `Engine.Walker.GetAutoRecorderOptions() -> any`
+- `Engine.Walker.GetAutoExploreConnectorRecording() -> boolean`
+- `Engine.Walker.GetAutoExploreConnectors() -> table[]`
+- `Engine.Walker.GetAutoExploreSettings() -> table`
+- `Engine.Walker.GetAutoExploreStatus() -> table`
+- `Engine.Walker.GetNavigationMode() -> string`
 - `Engine.Walker.GetDebugHud() -> any`
 - `Engine.Walker.GetDistanceBetweenWaypoints() -> any`
 - `Engine.Walker.GetLeaveLureOnPlayer() -> any`
 - `Engine.Walker.GetLeaveLurePlayerMode() -> integer`
 - `Engine.Walker.GetNodeDistance() -> any`
 - `Engine.Walker.GetSelectedWaypointIndex() -> any`
+- `Engine.Walker.GetSpecialAreaCount() -> integer`
+- `Engine.Walker.GetSpecialAreas() -> table[]`
 - `Engine.Walker.GetStartFromNearestWaypoint() -> any`
 - `Engine.Walker.GetWalkToLureCenter() -> any`
 - `Engine.Walker.GetWaypointCount() -> any`
@@ -2524,14 +2698,25 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Walker.InsertWaypoint() -> any`
 - `Engine.Walker.IsEnabled() -> any`
 - `Engine.Walker.IsPausedByLua() -> any`
+- `Engine.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
+- `Engine.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
 - `Engine.Walker.IsStuck() -> any`
 - `Engine.Walker.MoveWaypointDown() -> any`
 - `Engine.Walker.MoveWaypointUp() -> any`
+- `Engine.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
 - `Engine.Walker.ReplaceWaypoint() -> any`
 - `Engine.Walker.Resume() -> any`
 - `Engine.Walker.SelectClosestWaypoint() -> any`
 - `Engine.Walker.SetAutoRecorderEnabled() -> any`
 - `Engine.Walker.SetAutoRecorderOptions() -> any`
+- `Engine.Walker.AddAutoExploreConnector(connector: table) -> integer|string|false`
+- `Engine.Walker.ClearAutoExploreConnectors() -> boolean`
+- `Engine.Walker.DeleteAutoExploreConnector(id: integer|string) -> boolean`
+- `Engine.Walker.ResetAutoExploreCoverage() -> boolean`
+- `Engine.Walker.SetAutoExploreConnectorRecording(enabled: boolean) -> boolean`
+- `Engine.Walker.SetAutoExploreSettings(settings: table) -> boolean`
+- `Engine.Walker.SetNavigationMode(mode: string) -> boolean`
+- `Engine.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: table) -> boolean`
 - `Engine.Walker.SetDebugHud() -> any`
 - `Engine.Walker.SetDistanceBetweenWaypoints() -> any`
 - `Engine.Walker.SetEnabled() -> any`
@@ -2543,6 +2728,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Walker.SetStartFromNearestWaypoint() -> any`
 - `Engine.Walker.SetWalkToLureCenter() -> any`
 - `Engine.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
+- `Engine.Walker.UpdateSpecialArea(id: integer|string, updateData: table) -> boolean`
 
 ### event_proxies.lua
 - `BattleMessageProxy:GetName() -> string`
@@ -3031,6 +3217,11 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `SpeakClasses.TALKTYPE_SPELL_USE = 9`
 - `SpeakClasses.TALKTYPE_WHISPER = 2`
 - `SpeakClasses.TALKTYPE_YELL = 3`
+- `SpecialAreaFeature.All = 15`
+- `SpecialAreaFeature.Looter = 8`
+- `SpecialAreaFeature.MagicShooter = 4`
+- `SpecialAreaFeature.Targeting = 2`
+- `SpecialAreaFeature.Walker = 1`
 - `VipFlag.AIM_TARGET = 4`
 - `VipFlag.CROSS = 8`
 - `VipFlag.GREEN_TARGET = 10`
@@ -3202,12 +3393,23 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Sound.ClearQueue()`
 - `Sound.GetCurrentDuration() -> integer`
 - `Sound.GetFileDuration(filePath: string) -> integer`
+- `Sound.GetQueueLength() -> number`
 - `Sound.GetQueueSize() -> integer`
 - `Sound.IsPlaying() -> boolean`
 - `Sound.IsQueued(options: table) -> boolean`
 - `Sound.Play(options: table)`
+- `Sound.PlayAndWait(options: table, maxWaitMs?: number) -> boolean`
+- `Sound.PlayBotSound(filename: string, instant?: boolean)`
+- `Sound.PlayById(soundId: number, instant?: boolean)`
+- `Sound.PlayByIdSmart(soundId: number, instant?: boolean) -> boolean`
+- `Sound.PlayByName(soundName: string, instant?: boolean)`
+- `Sound.PlayByNameSmart(soundName: string, instant?: boolean) -> boolean`
+- `Sound.PlayFile(filePath: string, instant?: boolean)`
+- `Sound.PlayFileSmart(filePath: string, instant?: boolean) -> boolean`
 - `Sound.SetMinDelay(delayMs: integer)`
 - `Sound.Stop()`
+- `Sound.StopAll()`
+- `Sound.WaitForCompletion(maxWaitMs?: number) -> boolean`
 - `Time.MonotonicMs() -> integer`
 
 ### spells.lua
