@@ -20,7 +20,13 @@ For highest accuracy:
 3. Instruct the LLM to treat undocumented APIs as unavailable.
 4. Ask for strict argument validation and nil-safe logic.
 
-This file includes a curated behavior guide plus an auto-generated public API appendix derived from `docs/Scripts/core`. The appendix lists canonical function names, parameter types where annotated, and return types while deliberately omitting local helpers, compatibility aliases, raw bindings, protocol details, and bootstrap internals.
+This file includes a curated behavior guide plus an auto-generated public API
+appendix derived from `docs/Scripts/core`. Every listed function has explicit
+parameter and return types; structured values use the exact named records in
+this document. The contracts were cross-checked against the Lua wrappers and
+native binding validators instead of trusting legacy annotations alone. The
+appendix deliberately omits local helpers, compatibility aliases, raw bindings,
+protocol details, and bootstrap internals.
 
 ## Runtime Model
 
@@ -37,9 +43,11 @@ This file includes a curated behavior guide plus an auto-generated public API ap
 - The top-level script body is a managed coroutine. After it finishes, the
   runtime resolves and starts `init()` from the same private `_ENV`, if present.
   `init()` is also managed and may call `wait`, HTTP, or WebSocket APIs.
-- `Module` callbacks, scheduled callbacks, and registered event callbacks run as
-  managed coroutines. Long or repeated work must yield with `wait(ms)` or return
-  promptly and be scheduled again.
+- `Module` callbacks and scheduled callbacks run as managed coroutines and may
+  yield cooperatively. Registered event/hook callbacks also use managed
+  coroutines, but they are latency-sensitive producers: they must be
+  constant-time, non-yielding, and return immediately after copying only the
+  minimum scalar data into a coalesced slot or explicitly bounded queue.
 - `terminate()` is different: it is protected synchronous cleanup, cannot yield,
   has a 50 ms execution limit, and runs at most once. Do not start HTTP,
   WebSocket, scheduled, or module work from it.
@@ -88,7 +96,7 @@ can handle meaningfully, then either recover or rethrow with context.
 - Explicit cleanup in `terminate()` is useful for restoring feature settings the
   script deliberately changed, but native owner-scoped resources are also
   released automatically.
-- Per script: 64 MiB Lua memory, 256 managed coroutines, 64 pending event
+- Per script: 64 MiB Lua memory, 256 managed coroutines, 64 active-plus-pending event
   callbacks, and 32 outstanding async result tokens.
 - Scheduler limits are 3 ms per coroutine resume, 4 ms per script per frame, and
   8 ms for all Lua work per frame. Yieldable Lua is time-sliced. Deadline misses
@@ -121,11 +129,121 @@ can handle meaningfully, then either recover or rethrow with context.
    over assuming the previous state and toggling blindly.
 10. Use `Time.MonotonicMs()` for elapsed time. Never use `os.clock()` for
     wall-time timeouts.
-11. Keep callbacks short, use stable owner-local IDs, and avoid high-frequency
-    allocation or full-creature scans when a smaller query suffices.
+11. Every event/hook callback must follow the critical-path rule below. It must
+    be constant-time and non-yielding; it may only capture minimal scalar data
+    into a coalesced slot or hard-bounded queue and then return.
 12. If the script changes persistent bot configuration, state whether the
     change should remain after the script stops and restore it in `terminate()`
     when appropriate.
+
+## Event And Hook Callback Critical-Path Rule
+
+This rule applies to every callback registered through `Events`, `Hotkeys`,
+`Cavebot`/`Walker`, `SharedStorageScope:OnChanged`, an event proxy, HUD
+click/drag APIs, or another callback-taking event API.
+Every covered callback must be constant-time and non-yielding: capture only the
+minimum already-decoded scalar state and return immediately.
+
+The native hook normally validates, copies, and queues a managed event
+coroutine; the user callback is resumed later by the serialized Lua scheduler
+on the game thread. Yielding releases the game thread while the coroutine is
+asleep, but it does **not** finish that event callback. The callback continues
+to occupy one of the script's 64 active-plus-pending event slots. A burst of
+callbacks that call `wait`, HTTP, WebSocket receive/connect, or another
+yielding API can therefore reach the limit and produce
+`runtime_action=drop_newest_event_callback`. Synchronous native work executes
+while Lua is on the game-thread path and can directly cause frame-time spikes.
+
+An event callback may only:
+
+- validate fields already present in its callback arguments;
+- copy the minimum required strings, numbers, and booleans;
+- set a flag, sequence number, or monotonic timestamp;
+- overwrite one pending/coalesced state slot, or append to an explicitly
+  bounded in-memory queue with a deliberate overflow policy;
+- optionally issue one documented constant-time, non-blocking game action;
+- return immediately.
+
+An event callback must never:
+
+- call `wait`, `Http.*`, `WebSocket.Connect`,
+  `WebSocketConnection:Receive`, yielding HUD getters, or sound wait helpers;
+- call `Storage`, shared-storage reads/writes/updates, profile save/load,
+  `io.*`, filesystem APIs, or other lock/file-backed operations;
+- call or invent a `Synchronize`, `RunOnMainThread`, mutex, condition-variable,
+  or other cross-thread locking helper. The callback is already dispatched on
+  the serialized Lua/game-thread path; synchronizing it again can block frames
+  or deadlock;
+- encode/decode large JSON, recursively traverse an event table, scan all
+  creatures/containers/map tiles, perform pathfinding, or do other
+  variable-cost work;
+- contain retry, polling, or unbounded loops, or allocate an unbounded queue;
+- create one `Events.Schedule`, `Module.After`, module, or coroutine per
+  incoming event. That merely moves the backlog to another quota.
+
+Create one stable `Module.Every` worker in `init()`. The callback should feed
+the worker through either a single latest-value slot (best for level-triggered
+state and duplicate alerts) or a hard-bounded FIFO (only when every event
+matters). The worker drains a fixed maximum amount per invocation. Network
+waits belong in that worker. Persistent storage and other synchronous work must
+also be batched/debounced and kept infrequent because the worker still resumes
+Lua on the game thread.
+
+Use native packet filters whenever possible. In particular,
+`message_contains` on one incoming
+`GameServerOpcodes.GAME_SERVER_TEXT_MESSAGE` registration filters before a
+Lua packet table or callback coroutine is allocated.
+
+Walker observers follow the same enqueue-and-return rule. Label/action
+interceptors pause Walker until their callback finishes. If a decision truly
+requires slower work, call `Cavebot.Defer(timeoutMs)` inside the interceptor,
+put the returned handle plus minimal scalar inputs into the bounded worker
+queue, return immediately, and call `handle:Complete()` (or `:Cancel()`) on
+every expected completion/failure path. Do not call `wait` or HTTP directly in
+the interceptor.
+
+### Safe packet-to-worker pattern
+
+```lua
+local SCRIPT_ID = "discord_afk_alert"
+local WEBHOOK_URL = "REPLACE_WITH_DISCORD_WEBHOOK_URL"
+local pendingMessage = nil
+
+Events.RegisterPacketEvent({
+    id = SCRIPT_ID,
+    packet_id = GameServerOpcodes.GAME_SERVER_TEXT_MESSAGE,
+    incoming = true,
+    message_contains = "afk check started",
+    message_case_sensitive = false,
+
+    callback = function(packet)
+        -- Critical path: use the documented direct field, coalesce, return.
+        if pendingMessage == nil and type(packet.message) == "string" then
+            pendingMessage = packet.message
+        end
+    end
+})
+
+function init()
+    Module.Every(SCRIPT_ID .. "_worker", function()
+        local message = pendingMessage
+        if message == nil then
+            return
+        end
+
+        pendingMessage = nil
+        local response = Http.PostJson(WEBHOOK_URL, {
+            content = message
+        }, {
+            timeoutMs = 8000
+        })
+
+        if not response.ok then
+            print("Discord request failed: " .. tostring(response.error))
+        end
+    end, 100)
+end
+```
 
 ## Public Module Naming
 - Module tables are exposed for user scripts in PascalCase form.
@@ -255,6 +373,1648 @@ Important:
 - CooldownGroupId.GREAT_BEAMS = 9
 - CooldownGroupId.BURST_OF_NATURE = 10
 - CooldownGroupId.VIRTUE = 11
+
+## Canonical Types And Exact Table Contracts
+
+This section is authoritative for every `table`, object, callback payload, or
+structured option referenced by the API index. A field is required unless its
+name ends in `?`. `T[]` means a contiguous 1-based Lua array;
+`table<K, V>` means a key/value map. Field names are case-sensitive. Never
+guess aliases such as `container.index`, `item.id`, or `item.slot`.
+
+The audit covers every file loaded from `docs/Scripts/core`:
+`cavebot.lua`, `cavebot_actions.lua`, `chat_channel.lua`,
+`chat_channel_storage.lua`, `container.lua`, `cooldowns.lua`,
+`creature.lua`, `creature_iterators.lua`, `engine.lua`,
+`event_proxies.lua`, `features.lua`, `game.lua`, `hotkeys.lua`,
+`http.lua`, `hud_wrapper.lua`, `inventory.lua`, `item.lua`,
+`json.lua`, `lua_consts.lua`, `map.lua`, `minimap.lua`, `module.lua`,
+`npc_trade_storage.lua`, `position.lua`, `self.lua`, `sound.lua`,
+`spells.lua`, `storage.lua`, `vip.lua`, and `websocket.lua`.
+`zz_api_surface.lua` was also audited. It creates additional callable paths:
+Pascal-case aliases, `Query`/`Actions` buckets, and `Core.<Module>` mirrors.
+`zz_api_surface.lua` adds no new behavior or independent contract. To keep the index
+deterministic, Appendix A lists only the canonical function once; generated
+scripts must use those canonical names instead of the bootstrap aliases.
+
+### Common value types
+
+```text
+JsonPrimitive = nil | boolean | finite number | string | Json.Null
+JsonValue = JsonPrimitive | JsonValue[] | table<string, JsonValue>
+
+Position = {
+    x: integer,
+    y: integer,
+    z: integer
+}
+
+PositionLike = Position | a plain table with the same x/y/z fields
+
+ScreenPosition = {
+    x: number,
+    y: number
+}
+
+ColorRGBA = {
+    r: integer,  -- 0..255
+    g: integer,  -- 0..255
+    b: integer,  -- 0..255
+    a: integer   -- 0..255
+}
+
+ProfileSummary = {
+    index: integer,  -- 1-based
+    name: string
+}
+
+FeatureIdentifier = integer | string
+
+SettingsFeature = "healer"|"conditions"|"heal_friends"|"targeting"|
+    "alarms"|"magic_shooter"|"extras"|"equipment_manager"|
+    "channels_manager"|"pvp_tools"|"looter"|"combo_bot"|"hud"|
+    "delays"|"ammo_refill"|"tank_mode"|"timer_actions"|
+    "supplies_sorter"|"scripter"
+
+SettingsFeatureSelection = SettingsFeature[] | table<string, boolean>
+CavebotBundleFeature = "targeting"|"magic_shooter"|"looter"
+CavebotBundleFeatureSelection = CavebotBundleFeature[] |
+    table<string, boolean>
+```
+
+`Position.New(x, y, z)` and `Position.New(positionLike)` return a `Position`
+object with those three public fields plus the documented methods. Game,
+Map, Minimap, Creature, Self, Walker, packet, and world-HUD position records use
+the same exact `x`, `y`, and `z` names.
+
+### Item, map, and minimap records
+
+```text
+ObjectInfo = {
+    itemId: integer,
+    name: string,
+    description: string,
+    isCreature: boolean,
+    isWalkable: boolean,
+    isPassable: boolean,
+    isPathable: boolean,
+    isShootable: boolean,
+    isMovable: boolean,
+    isGround: boolean,
+    isBottom: boolean,
+    isTop: boolean,
+    isClip: boolean,
+    isForceUsable: boolean,
+    isLiquidPool: boolean,
+    isContainer: boolean,
+    isAutoMap: boolean,
+    isFloorChange: boolean,
+    isTeleport: boolean,
+    isUsable: boolean,
+    isMultiUsable: boolean,
+    isCumulative: boolean,
+    isHangable: boolean,
+    isRotatable: boolean,
+    isTakable: boolean,
+    isWritable: boolean,
+    isWriteOnce: boolean,
+    isReportable: boolean,
+    isWrapable: boolean,
+    isUnwrapable: boolean,
+    isTopEffect: boolean,
+    isPlayerCorpse: boolean,
+    isCreatureCorpse: boolean,
+    isLiquidContainer: boolean,
+    hasNoMovementAnimation: boolean,
+    isFlagsEmpty: boolean,
+    showsInCyclopedia: boolean,
+    tileSpeed: integer,
+    itemCategory: integer,
+    cyclopediaItemId: integer,
+    equipmentSlot: integer,
+    equipmentSlotByCategory: integer
+}
+
+MapTileFlags = {
+    isWalkable: boolean,
+    isPassable: boolean,
+    isPathable: boolean,
+    isBlockingPath: boolean,
+    hasCreature: boolean,
+    hasNpc: boolean,
+    hasGroundItem: boolean,
+    hasBlockingItem: boolean,
+    hasAutoMap: boolean,
+    hasTeleport: boolean,
+    speed: integer
+}
+
+MapTileItem = ObjectInfo plus {
+    stackPosition: integer,  -- 0-based tile stack position
+    count: integer
+}
+
+MapPathResult = {
+    Directions: integer[],  -- MoveDirection values; capital D is intentional
+    pathFindResult: integer -- PathFindResult value
+}
+
+MinimapTileInfo = {
+    position: Position,
+    flags: MapTileFlags|nil,
+    items: MapTileItem[],
+    pixelColor: integer|nil,
+    walkableByColor: boolean|nil
+}
+```
+
+Exact mappings:
+
+- `Item.GetInfo` and `Map.GetObjectInfo` return `ObjectInfo|nil`.
+- `Map.GetTileFlags` and `Minimap.GetTileFlags` return
+  `MapTileFlags|nil`.
+- `Map.GetTileItems` and `Minimap.GetTileItems` return `MapTileItem[]`.
+- `Map.FindPath` and `Minimap.FindPath` return `MapPathResult`.
+- `Minimap.GetTileInfo` returns `MinimapTileInfo`.
+- All documented Item/Map use, look, move, buy, and sell operations return a
+  boolean indicating whether the action was accepted/dispatched.
+
+### Container records
+
+```text
+ContainerItem = {
+    itemId: integer,
+    name: string,
+    slotIndex: integer,  -- 0-based
+    count: integer,
+    tierLevel: integer,
+    isUpgradable: boolean,
+    objectInfo: ObjectInfo|nil
+}
+
+ContainerSummary = {
+    containerNumber: integer,
+    containerId: integer,
+    name: string,
+    size: integer,
+    itemsCount: integer,
+    freeSlots: integer,
+    hasItems: boolean
+}
+
+ContainerSnapshot = ContainerSummary plus {
+    items: ContainerItem[]
+}
+
+ContainerFindResult = {
+    itemId: integer,
+    itemSlot: integer,       -- 0-based slot; not slotIndex
+    itemQuantity: integer,   -- not count
+    containerNumber: integer
+}
+```
+
+Function-to-record mapping:
+
+- `Container.GetOpenContainers() -> ContainerSummary[]`. These are summaries;
+  they intentionally do **not** contain an `items` field.
+- `Container.GetByNumber/GetByName/GetById -> ContainerSnapshot|nil`.
+- `Container.GetItems -> ContainerItem[]`.
+- `Container.GetItem` and `Item.GetFromContainer -> ContainerItem|nil`.
+- `Container.FindItem`, `Container.FindItemInOpenContainers`, and
+  `Item.FindInContainer -> ContainerFindResult|nil`.
+- Container move/use/look methods return `boolean`.
+
+Correct vial/container traversal:
+
+```lua
+for _, container in ipairs(Container.GetOpenContainers()) do
+    for _, item in ipairs(Container.GetItems(container.containerNumber)) do
+        if item.itemId == VIAL_ID then
+            Container.MoveItemToFloor(
+                container.containerNumber,
+                item.slotIndex,
+                item.itemId,
+                destination,
+                item.count)
+        end
+    end
+end
+```
+
+Do not substitute `container.index`, `container.containerIndex`,
+`item.id`, `item.itemSlot`, or `item.slot` in this traversal.
+`itemSlot` exists only on `ContainerFindResult`.
+
+### Equipment and inventory records
+
+```text
+EquipmentItem = {
+    itemId: integer,
+    item_id: integer,       -- exact compatibility alias of itemId
+    slot: integer,
+    slotIndex: integer,     -- exact compatibility alias of slot
+    count: integer,
+    itemCount: integer,     -- exact compatibility alias of count
+    tierLevel: integer,
+    isUpgradable: boolean,
+    name: string,
+    objectInfo: ObjectInfo|nil
+}
+
+EquipmentSlotConstants = {
+    NONE: 0, HELMET: 1, AMULET: 2, BACKPACK: 3, ARMOR: 4,
+    RIGHT_HAND: 5, LEFT_HAND: 6, LEGS: 7, BOOTS: 8, RING: 9,
+    ARROW: 10
+}
+
+InventorySnapshot = {
+    canReadEquipment: boolean,
+    canMoveEquipment: boolean,
+    slotIds: integer[],
+    slots: table<integer, EquipmentItem>
+}
+```
+
+`Inventory.GetSlotItem -> EquipmentItem|nil`;
+`Inventory.GetAllSlotItems -> table<integer, EquipmentItem>`;
+`Inventory.GetEquipmentSlotConstants -> EquipmentSlotConstants`; and
+`Inventory.GetSnapshot -> InventorySnapshot`. Only occupied equipment slots
+are present in the slot map. Equip, look, and movement calls return `boolean`.
+
+### Creature and local-player records
+
+```text
+CreatureOutfit = {
+    outfit_id: integer,
+    is_mounted: boolean
+}
+
+Creature = {
+    _id: integer,
+    _cached_name: string|nil
+}
+
+CreatureIterator = function() -> integer|nil, Creature|nil
+
+SelfStatusFlags = {
+    isHungry: boolean|nil,
+    isInRestingArea: boolean|nil,
+    isPoisoned: boolean|nil,
+    isBurning: boolean|nil,
+    isElectrified: boolean|nil,
+    isDrunk: boolean|nil,
+    isManaShielded: boolean|nil,
+    isParalyzed: boolean|nil,
+    isHasted: boolean|nil,
+    isInCombat: boolean|nil,
+    isDrowning: boolean|nil,
+    isFreezing: boolean|nil,
+    isDazzled: boolean|nil,
+    isCursed: boolean|nil,
+    isStrengthened: boolean|nil,
+    isInProtectionZone: boolean|nil,
+    isBleeding: boolean|nil,
+    isRooted: boolean|nil,
+    isFeared: boolean|nil
+}
+
+SelfStatsSnapshot = {
+    health: integer|nil,
+    maxHealth: integer|nil,
+    mana: integer|nil,
+    maxMana: integer|nil,
+    capacity: number|nil,
+    stamina: number|nil,
+    online: boolean|nil,
+    isAlive: boolean|nil,
+    isAttacking: boolean|nil,
+    isFollowing: boolean|nil,
+    manaShieldCapacity: integer|nil,
+    maxManaShieldCapacity: integer|nil,
+    targetId: integer|nil,
+    followId: integer|nil,
+    mousePosition: Position|nil,
+    mouseWorldX: integer|nil,
+    mouseWorldY: integer|nil,
+    mouseWorldZ: integer|nil,
+    capacityFloor: integer|nil,
+    level: integer|nil,
+    soul: integer|nil,
+    staminaHours: integer|nil,
+    staminaDays: integer|nil,
+    levelPercent: integer|nil,
+    healthPercent: number|nil,
+    manaPercent: number|nil,
+    hasTarget: boolean|nil,
+    hasFollow: boolean|nil,
+    statusFlags: SelfStatusFlags
+}
+```
+
+Creature iterator collection methods return `Creature[]`;
+`Creatures.GetCreatureByName -> Creature|nil`;
+`Creature:GetPosition -> Position` (an invalid wrapper produces zero
+coordinates); `Creature:GetOutfit -> CreatureOutfit`; and
+`Self.GetMousePositionInWorld -> Position|nil`.
+`Self.GetStatusFlagsSnapshot -> SelfStatusFlags` and
+`Self.GetStatsSnapshot -> SelfStatsSnapshot`.
+
+### JSON, network, scheduler, hotkey, and sound records
+
+`OpaqueRuntimeValue` below means a native table or userdata value retained only
+for diagnostics. Its internal fields are not a public contract and generated
+scripts must not inspect them.
+
+```text
+OpaqueRuntimeValue = native table | userdata
+
+HttpRequestOptions = {
+    url: string,
+    method?: "GET"|"POST"|"PUT"|"PATCH"|"DELETE"|"HEAD", -- default GET
+    headers?: table<string, string>,
+    body?: string,
+    timeoutMs?: integer,
+    maxResponseBytes?: integer,
+    followRedirects?: boolean
+}
+
+HttpConvenienceOptions = {
+    headers?: table<string, string>,
+    body?: string,                   -- effective only for Http.Get/GetJson
+    timeoutMs?: integer,
+    maxResponseBytes?: integer,
+    followRedirects?: boolean
+}
+
+HttpHeader = {
+    name: string,
+    value: string
+}
+
+HttpResponse = {
+    ok: boolean,
+    status: integer,
+    redirects: integer,
+    body: string,
+    error: string,
+    url: string,
+    headers: table<string, string>, -- lower-case names; repeated values combined
+    headerList: HttpHeader[]        -- ordered and preserves repeated headers
+}
+
+WebSocketConnectOptions = {
+    headers?: table<string, string>,
+    subprotocol?: string,
+    timeoutMs?: integer,
+    maxMessageBytes?: integer
+}
+
+WebSocketEvent = {
+    ok: boolean,
+    connectionId: integer,
+    closeCode: integer,
+    type: "text"|"binary"|"close"|"error"|"timeout",
+    data: string,
+    error: string,
+    url: string
+}
+
+WebSocketConnection = {
+    url: string,
+    Send: function(data: string, binary?: boolean) -> boolean, string|nil,
+    Receive: function(timeoutMs?: integer) -> WebSocketEvent,
+    Close: function(closeCode?: integer, reason?: string) -> boolean, string|nil,
+    IsOpen: function() -> boolean
+}
+
+ParsedHotkey = {
+    keycode: integer,
+    ctrl: boolean,
+    shift: boolean,
+    alt: boolean,
+    trigger_on_keydown: boolean,
+    extended: boolean
+}
+
+HotkeyRegistrationOptions = {
+    id: string,
+    combo: string,
+    callback: function(),
+    name?: string,
+    trigger_on_keydown?: boolean,
+    extended?: boolean
+}
+
+ModuleRecord = {
+    mode: "every"|"after",
+    delayMs: integer,
+    active: boolean
+}
+
+ModuleListRecord = ModuleRecord plus {
+    name: string
+}
+
+SoundPlaybackOptions = exactly one of {
+    sound_id: integer,
+    sound_name: string,
+    file_path: string
+} plus {
+    instant?: boolean
+}
+```
+
+Exact network and scheduler returns:
+
+- `Http.Request -> HttpResponse` and takes `HttpRequestOptions`, including its
+  required `url`. `Http.Get/Post/PostJson -> HttpResponse` and take
+  `HttpConvenienceOptions`; their separate arguments supply the URL and, for
+  Post/PostJson, replace the request body.
+- `Http.GetJson -> JsonValue|nil, HttpResponse, string|nil`. The third result
+  is a decode error; inspect it when the first result is `nil`.
+- `WebSocket.Connect -> WebSocketConnection|nil, string|nil`.
+- `WebSocketConnection:Receive -> WebSocketEvent`; `Send` and `Close` return
+  `boolean, string|nil`; `IsOpen -> boolean`.
+- `Hotkeys.ParseCombo -> ParsedHotkey|nil, string|nil` and
+  `Hotkeys.RegisterCombo -> boolean, string`, where the string is the opaque
+  owner-scoped registration ID. A registered hotkey callback takes no
+  arguments and must obey the event critical-path rule.
+- Raw `Module.New/Stop/Pause/Resume -> nil`.
+  `Module.Every/After/Cancel/PauseManaged/ResumeManaged -> boolean`;
+  `Module.Exists -> boolean`; `Module.Get -> ModuleRecord|nil`; and
+  `Module.List -> ModuleListRecord[]`.
+- `Sound.Play/Stop/ClearQueue/SetMinDelay -> nil`.
+  The helper `PlayById/PlayByName/PlayFile/PlayBotSound/StopAll -> nil`;
+  smart and wait helpers return `boolean`. `Sound.IsQueued` accepts the same
+  exact source-selection fields as `Sound.Play`.
+
+`Json.Encode/TryEncode` accept `JsonValue`; `Json.Decode/TryDecode` return
+`JsonValue`. `Json.Array` takes a contiguous `JsonValue[]` and returns the same
+array tagged for JSON-array encoding. `Json.Object` takes and returns a
+`table<string, JsonValue>` tagged for JSON-object encoding. Do not pass native
+userdata, functions, threads, cyclic tables, non-finite numbers, or mixed
+array/object keys.
+
+### Chat channel, NPC trade, and VIP records
+
+```text
+ChatChannelRecord = {
+    id: integer,
+    name: string,
+    canSend: boolean,
+    isOpened: boolean,
+    isLocal: boolean,
+    isServerLog: boolean,
+    raw: OpaqueRuntimeValue|nil
+}
+
+ChatChannelInput = {
+    id?: integer,          -- channelId is also accepted as an input alias
+    name?: string,         -- channelName is also accepted as an input alias
+    canSend?: boolean,
+    isOpened?: boolean,
+    isLocal?: boolean,
+    isServerLog?: boolean,
+    raw?: OpaqueRuntimeValue
+}
+
+ChatChannelIdentifier = integer | string | ChatChannelRecord |
+    { id: integer } | { channelId: integer } |
+    { name: string } | { channelName: string }
+
+ChatChannelStorageSnapshot = {
+    available: boolean,
+    openedCount: integer,
+    chatCount: integer,
+    openedNames: string[],
+    sendableNames: string[],
+    localChannel: ChatChannelRecord|nil,
+    serverLogChannel: ChatChannelRecord|nil,
+    openedChannels: ChatChannelRecord[],
+    chatChannels: ChatChannelRecord[]
+}
+
+NpcTradeOffer = {
+    itemId: integer,
+    name: string,
+    buyPrice: number,
+    sellPrice: number,
+    capacity: number,
+    raw: OpaqueRuntimeValue
+}
+
+NpcTradeSnapshot = {
+    available: boolean,
+    isOpen: boolean|nil,
+    npcName: string|nil,
+    offerCount: integer,
+    offers: NpcTradeOffer[]
+}
+
+VIPEntry = {
+    name: string,
+    description: string,
+    type: integer,
+    online: boolean,
+    notifyOnLogin: boolean,
+    raw: OpaqueRuntimeValue
+}
+
+VIPSnapshot = {
+    available: boolean,
+    count: integer,
+    onlineCount: integer,
+    heartCount: integer,
+    names: string[],
+    onlineNames: string[],
+    vips: VIPEntry[]
+}
+```
+
+`ChatChannel.New(ChatChannelInput|integer, channelName?) -> ChatChannel`, whose
+public data fields match `ChatChannelRecord` and whose methods are listed in the
+API index. `ChatChannel.FromIdentifier/GetById/GetByName -> ChatChannel|nil`;
+`ChatChannel:ToTable -> ChatChannelRecord`.
+`ChatChannelStorage.GetOpenedChannels/GetChatChannels -> ChatChannelRecord[]`;
+all single-channel getters and `ResolveChannel` return
+`ChatChannelRecord|nil`; `ToNameLookupTable -> table<string,
+ChatChannelRecord>`; `ToIdLookupTable -> table<integer, ChatChannelRecord>`;
+and `GetSnapshot -> ChatChannelStorageSnapshot`.
+
+`NpcTradeStorage.GetOffers -> NpcTradeOffer[]`; its offer getters return
+`NpcTradeOffer|nil`; `GetSnapshot -> NpcTradeSnapshot`; and `Buy/Sell ->
+boolean`. `VIP.GetAll/GetByType/GetHearts/FindByPrefix -> VIPEntry[]`;
+`VIP.Get -> VIPEntry|nil`; `VIP.ToLookupTable -> table<string, VIPEntry>`; and
+`VIP.GetSnapshot -> VIPSnapshot`.
+
+### Cooldown and spell records
+
+```text
+CooldownSpellStatus = {
+    inCooldown: boolean,
+    timeLeft: integer
+}
+
+CooldownStatus = {
+    spells: table<string, CooldownSpellStatus>,
+    groups: {
+        attack: integer,
+        healing: integer,
+        support: integer,
+        special: integer,
+        crippling: integer,
+        focus: integer,
+        ultimate: integer
+    },
+    useWith: boolean
+}
+
+SpellInfo = {
+    id: integer|nil,
+    words: string,
+    cooldownId: integer|nil,
+    groupIds: integer[],
+    inCooldown: boolean,
+    leftCooldownTime: integer
+}
+
+ItemSpellInfo = {
+    id: integer,
+    cooldownId: integer|nil,
+    groupIds: integer[],
+    inCooldown: boolean,
+    leftCooldownTime: integer
+}
+```
+
+All cooldown-time functions return integer milliseconds and all `Is*` or
+`WillBeReady` functions return booleans. `Cooldowns.Utils.GetStatus ->
+CooldownStatus`; `Spells.GetInfo -> SpellInfo`; `Spells.Item.GetInfo ->
+ItemSpellInfo`; both `GetGroupIds` functions return `integer[]`;
+`Spells.GetIdByWords/GetIdByName/Spells.Item.GetCooldownId -> integer|nil`; and
+`Spells.GetWordsById -> string|nil`. A `spellOrWordsOrId` argument is exactly a
+non-empty spell-words `string` or a numeric spell cooldown ID.
+
+### Cavebot, Walker, Lure, and action records
+
+```text
+WalkerWaypointInput = {
+    type?: integer,                 -- default WaypointType.Node
+    x?: integer,
+    y?: integer,
+    z?: integer,
+    labelName?: string,
+    useWithItemId?: integer,
+    delayMs?: integer,
+    scriptContent?: string
+}
+
+RawWalkerWaypointInput = WalkerWaypointInput plus {
+    useItemId?: integer,
+    useTarget?: integer,
+    actionWaypointKind?: integer,
+    actionKind?: string,
+    actionVersion?: string,
+    actionConfig?: table<string, JsonValue>,
+    failurePolicy?: table<string, JsonValue>
+}
+
+WalkerNavigationMode = "waypoints"|"auto_explore"
+
+WalkerWaypoint = {
+    index: integer,                 -- 1-based current route index
+    type: integer,
+    x: integer,
+    y: integer,
+    z: integer,
+    useWithItemId: integer,
+    useItemId: integer,
+    useTarget: integer,
+    actionWaypointKind: integer,
+    delayMs: integer,
+    labelName: string,
+    scriptContent: string,
+    actionKind: string,
+    actionVersion: string,
+    actionConfig: JsonValue,
+    failurePolicy: JsonValue,
+    uniqueId: integer
+}
+
+WalkerSpecialAreaInput = {
+    x: integer,
+    y: integer,
+    z: integer,
+    width?: integer,
+    height?: integer,
+    featureMask?: integer,
+    enabled?: boolean
+}
+
+WalkerSpecialAreaPatch = {
+    x?: integer,
+    y?: integer,
+    z?: integer,
+    width?: integer,
+    height?: integer,
+    featureMask?: integer,
+    enabled?: boolean
+}
+
+WalkerSpecialArea = {
+    index: integer,
+    id: integer|string,
+    uniqueId: integer|string,       -- exact alias of id
+    x: integer,
+    y: integer,
+    z: integer,
+    width: integer,
+    height: integer,
+    featureMask: integer,
+    enabled: boolean
+}
+
+WalkerAutoRecorderOptions = {
+    recordMovementActions: boolean,
+    recordUseItemActions: boolean,
+    recordUseWithActions: boolean
+}
+
+WalkerAutoRecorderOptionsPatch = the same fields, all optional
+
+WalkerAutoExploreSettings = {
+    style: "natural"|"thorough"|"wide_roam",
+    maximumFloorsUp: integer,
+    maximumFloorsDown: integer,
+    allowWalkOn: boolean,
+    allowLadder: boolean,
+    allowRope: boolean,
+    allowHole: boolean,
+    allowTeleport: boolean,
+    autoOpenDoors: boolean
+}
+
+WalkerAutoExploreSettingsPatch = the same fields, all optional
+
+WalkerAutoExploreVisitHeat = {
+    position: Position,
+    visitCount: integer,
+    lastVisitSequence: integer
+}
+
+WalkerAutoExploreStatus = {
+    phase: "idle"|"exploring"|"fighting"|"transition"|"recovering"|
+        "paused"|"stuck",
+    hasBasePosition: boolean,
+    basePosition: Position,
+    currentPosition: Position,
+    hasTarget: boolean,
+    targetPosition: Position,
+    visitedTileCount: integer,
+    paintedTileCount: integer,
+    activeConnectorId: integer|string,
+    outsideMask: boolean,
+    status: string,
+    latestFailureReason: string,
+    plannedPath: Position[],
+    recentTrail: Position[],
+    recentVisitHeat: WalkerAutoExploreVisitHeat[]
+}
+
+WalkerAutoExploreConnectorInput = {
+    enabled?: boolean,
+    kind: "walk_on"|"ladder"|"rope"|"hole"|"teleport",
+    source: Position,
+    destination: Position,
+    pairedConnectorId?: integer|string
+}
+
+WalkerAutoExploreConnectorPatch = the same fields, all optional
+
+WalkerAutoExploreConnector = {
+    id: integer|string,
+    enabled: boolean,
+    kind: "walk_on"|"ladder"|"rope"|"hole"|"teleport",
+    source: Position,
+    destination: Position,
+    pairedConnectorId: integer|string
+}
+
+LureSettingInput = {
+    lureMonstersCount?: integer,
+    leaveMonstersCount?: integer,
+    dontLeaveMonstersUnderHpPerc?: integer,
+    monsterDangerLevel?: integer,
+    considerDangerLevelsAbove?: boolean,
+    enabled?: boolean
+}
+
+LureSetting = {
+    index: integer,
+    lureMonstersCount: integer,
+    leaveMonstersCount: integer,
+    dontLeaveMonstersUnderHpPerc: integer,
+    monsterDangerLevel: integer,
+    considerDangerLevelsAbove: boolean,
+    enabled: boolean
+}
+
+CavebotStatus = {
+    walkerEnabled: boolean,
+    lureEnabled: boolean,
+    walkerStuck: boolean,
+    lureState: integer,
+    lureMonsterCount: integer,
+    waypointCount: integer,
+    selectedWaypointIndex: integer|nil
+}
+
+CavebotDeferredHandle = {
+    token: integer,
+    Complete: function(self) -> boolean,
+    Cancel: function(self) -> boolean
+}
+
+CavebotWaypointChangeEvent = {
+    previousIndex: integer|nil,
+    index: integer,
+    type: integer,
+    x: integer,
+    y: integer,
+    z: integer,
+    label: string,
+    labelName: string,              -- exact alias of label
+    uniqueId: integer
+}
+
+CavebotActionWaypointRef = {
+    index: integer,
+    uniqueId: integer,
+    x: integer,
+    y: integer,
+    z: integer
+}
+
+CavebotActionStartedEvent = {
+    executionId: integer,
+    action: string,
+    name: string,                   -- exact alias of action
+    kind: integer,
+    waypoint: CavebotActionWaypointRef
+}
+
+CavebotActionCompletedEvent = CavebotActionStartedEvent plus {
+    ok: boolean,
+    outcome: string,
+    description: string,
+    durationMs: integer,
+    result?: string,                -- present only when ok is true
+    error?: string                  -- present only when ok is false
+}
+
+WalkerEventCallback = exactly one callback shape selected by eventId:
+    ON_LABEL or OBSERVE_LABEL:
+        function(labelName: string)
+    ON_WAYPOINT_CHANGE:
+        function(previousIndex: integer, index: integer, type: integer,
+            x: integer, y: integer, z: integer, labelName: string,
+            uniqueId: integer)
+    ON_ACTION or OBSERVE_ACTION:
+        function(actionName: string)
+    ACTION_STARTED:
+        function(executionId: integer, actionName: string, kind: integer,
+            waypointIndex: integer, waypointUniqueId: integer,
+            x: integer, y: integer, z: integer)
+    ACTION_COMPLETED:
+        function(executionId: integer, actionName: string, kind: integer,
+            waypointIndex: integer, waypointUniqueId: integer,
+            x: integer, y: integer, z: integer, ok: boolean,
+            outcome: string, description: string, durationMs: integer)
+```
+
+`WalkerWaypointInput` is the exact high-level Cavebot wrapper input. It
+deliberately has no `index` or `uniqueId`, and it also does not accept the
+output-only `useItemId`, `useTarget`, `actionWaypointKind`, `actionKind`,
+`actionVersion`, `actionConfig`, or `failurePolicy` fields. The wrapper
+normalizer discards those keys before calling native Walker. Do not round-trip a
+`WalkerWaypoint` snapshot and expect those fields to survive.
+`RawWalkerWaypointInput` is accepted only by the lower-level
+`Engine.Walker.AddWaypoint/InsertWaypoint/ReplaceWaypoint` aliases. Prefer the
+high-level `Cavebot.Walker` wrapper unless an Action waypoint requires the raw
+fields.
+`Walker.AddWaypoint -> integer|false` returns the new 1-based index. Insert,
+replace, delete, clear, move, and waypoint-position mutations return `boolean`.
+`Walker.GetWaypoints -> WalkerWaypoint[]`.
+`Walker.GetSelectedWaypointIndex -> integer|nil`; all other waypoint count or
+distance getters return integers.
+
+`Walker.GetSpecialAreas -> WalkerSpecialArea[]` and
+`AddSpecialArea -> integer|string|false`. Update accepts only
+`WalkerSpecialAreaPatch`; unknown keys are rejected. Auto-explore getters
+return the named records above, connector add returns
+`integer|string|false`, and the mutation functions return booleans.
+`SetAutoRecorderOptions` accepts `WalkerAutoRecorderOptionsPatch`; omitted
+fields retain their previous values. Its getter returns the required-field
+`WalkerAutoRecorderOptions` snapshot.
+
+`Lure.GetSettings -> LureSetting[]`; `Lure.AddSetting -> integer|false`;
+`UpdateSetting/RemoveSetting/ClearSettings -> boolean`. Lure boolean getters
+return booleans, numeric state/count/option/range/delay getters return integers,
+and setters other than raw `Lure.SetEnabled` return booleans. Raw
+`Walker.SetEnabled`, `Lure.SetEnabled`, `Walker.Resume`, and `Walker.GoTo`
+return no values (`nil`).
+
+The high-level Cavebot callback signatures are exact:
+
+- `OnLabel/InterceptLabel/ObserveLabel(function(labelName: string))`.
+- `OnAction/InterceptAction/ObserveAction(function(actionName: string))`.
+- `OnWaypointChange/ObserveWaypointChange(function(event:
+  CavebotWaypointChangeEvent))`.
+- `OnActionStarted(function(event: CavebotActionStartedEvent))`.
+- `OnActionCompleted(function(event: CavebotActionCompletedEvent))`.
+
+Each registration returns `integer|nil`. Use these named helpers instead of
+`RegisterEvent` when possible because the raw callback argument list depends on
+the selected `WalkerEvent`. Every callback above is an event critical path.
+Observer callbacks must return immediately. Legacy label/action interceptors
+also pause Walker; if asynchronous work is required, create a
+`CavebotDeferredHandle`, enqueue only its token plus minimal scalar data, return,
+and complete/cancel it from the stable worker.
+
+`Cavebot.SetEnginesEnabled/GetStatus -> CavebotStatus`;
+`Cavebot.Defer -> CavebotDeferredHandle`; `Cavebot.Pause -> string|nil`
+(scheduled-event ID only when auto-resume is requested); Cavebot enable/disable,
+resume, and go-to calls return `nil`; `UnregisterAllEvents -> boolean`.
+
+#### Cavebot action context and results
+
+```text
+CavebotSupplyItem = {
+    itemId: integer,
+    name?: string,
+    enabled?: boolean,
+    min?: integer,
+    target?: integer,
+    buy?: { enabled?: boolean },
+    ignoreCapacity?: boolean,
+    buyInShoppingBags?: boolean,
+    sellEquipped?: boolean,
+    keep?: integer,
+    amount?: integer
+}
+
+CavebotSupplyProfile = {
+    checkCapacity?: boolean,
+    minCapacity?: number,
+    checkStamina?: boolean,
+    minStaminaMinutes?: integer,
+    items?: CavebotSupplyItem[]
+}
+
+CavebotVendorProfile = {
+    talkSequence?: string[]
+}
+
+CavebotActionContext = {
+    actionType?: string,             -- action_type is accepted as an alias
+    actionConfig?: table<string, JsonValue>, -- action_config alias accepted
+    vendorProfile?: CavebotVendorProfile, -- vendor_profile alias accepted
+    supplyProfile?: CavebotSupplyProfile, -- supply_profile alias accepted
+    successLabel?: string,
+    failureLabel?: string,
+    configRef?: JsonValue,           -- config_ref alias accepted
+    messages?: string|string[],
+    message?: string,
+    sellItems?: CavebotSupplyItem[],
+    script?: string
+}
+
+CavebotActionItemResult = {
+    itemId: integer,
+    amount?: integer,
+    count?: integer,
+    min?: integer,
+    target?: integer,
+    keep?: integer,
+    low?: boolean,
+    countAvailable?: boolean,
+    reason?: string,
+    error?: string,
+    name?: string
+}
+
+CavebotActionResult = {
+    ok: boolean,
+    actionType?: string,
+    error?: string,
+    pending?: boolean,
+    goToLabel?: string,              -- gotoLabel also accepted from custom handlers
+    configRef?: JsonValue,
+    value?: JsonValue,
+    sent?: string[],
+    failedMessage?: string,
+    needsRefill?: boolean,
+    reasons?: string[],
+    capacity?: number,
+    staminaMinutes?: integer,
+    items?: CavebotActionItemResult[],
+    npcTalk?: string[],
+    bought?: CavebotActionItemResult[],
+    sold?: CavebotActionItemResult[],
+    skipped?: CavebotActionItemResult[],
+    errors?: CavebotActionItemResult[]
+}
+```
+
+`actionConfig` is deliberately an open, JSON-compatible action-specific map.
+Built-in handlers currently read keys such as `params`, `messages`, and
+`talkSequence`, and custom handlers may define additional keys. Do not assume
+those examples are the only legal fields.
+
+`Cavebot.Actions.Register(actionType, handler)` expects
+`handler(context: CavebotActionContext) -> CavebotActionResult` and returns
+`boolean`. `Cavebot.Actions.Run -> CavebotActionResult` and
+`GetLastResult -> CavebotActionResult|nil`. A custom handler may add fields,
+but should keep them JSON-compatible and must preserve the common `ok` result
+contract.
+
+### Engine feature snapshot records
+
+Every Engine getter below returns a detached snapshot. Mutating it never changes
+the running feature; use the matching setter. Entry and profile indexes are
+1-based.
+
+```text
+TimerActionEntry = {
+    index: integer,
+    spellWords: string,
+    itemId: integer,
+    type: integer,
+    delay: integer,
+    timeUnit: integer,
+    enabled: boolean,
+    useInProtectionZone: boolean
+}
+
+SuppliesSorterEntry = {
+    index: integer,
+    destinationContainerId: integer,
+    itemIds: integer[],
+    enabled: boolean
+}
+
+ChannelManagerEntry = {
+    index: integer,
+    name: string,
+    message: string,
+    intervalSeconds: integer,
+    channelId: integer,
+    talkAction: integer,
+    enabled: boolean
+}
+
+ConditionSpellEntry = {
+    index: integer,
+    spellWords: string,
+    manaCost: integer,
+    characterFlag: integer,
+    enabled: boolean
+}
+
+HealerSpellInput = {
+    spell_words?: string,
+    cast_value?: integer,
+    mana_cost?: integer,
+    attribute?: "health"|"healthpercent"|"mana"|"manapercent",
+    condition?: "below"|"above",
+    enabled?: boolean
+}
+
+HealerSpellPatch = {
+    cast_value?: integer,
+    mana_cost?: integer,
+    enabled?: boolean
+}
+
+HealerSpellEntry = {
+    spell_words: string,
+    cast_value: integer,
+    mana_cost: integer,
+    attribute: "health"|"health_percent"|"mana"|"mana_percent"|"unknown",
+    condition: "below"|"above"|"unknown",
+    enabled: boolean,
+    display_string: string
+}
+
+IndexedHealerSpellEntry = HealerSpellEntry plus {
+    index: integer -- added only by Engine.Healer.FindSpellByWords
+}
+
+HealerItemInput = {
+    item_id?: integer,
+    cast_value?: integer,
+    delay_ms?: integer,
+    attribute?: "health"|"healthpercent"|"mana"|"manapercent",
+    condition?: "below"|"above",
+    action?: "useonself"|"useincontainer",
+    use_when_feared?: boolean,
+    enabled?: boolean
+}
+
+HealerItemPatch = {
+    cast_value?: integer,
+    delay_ms?: integer,
+    enabled?: boolean
+}
+
+HealerItemEntry = {
+    index: integer, -- added by Engine.Healer.GetItems/FindItemById
+    item_id: integer,
+    cast_value: integer,
+    delay_ms: integer,
+    attribute: "health"|"health_percent"|"mana"|"mana_percent"|"unknown",
+    condition: "below"|"above"|"unknown",
+    action: "use_on_self"|"use_in_container"|"unknown",
+    use_when_feared: boolean,
+    enabled: boolean,
+    display_string: string
+}
+
+AmmoRefillInput = {
+    item_id?: integer,
+    refill_at_count?: integer,
+    refill_in_left_hand?: boolean,
+    equip_from_hotkey?: boolean,
+    enabled?: boolean
+}
+
+AmmoRefillEntry = AmmoRefillInput with all fields required plus {
+    display_string: string
+}
+
+IndexedAmmoRefillEntry = AmmoRefillEntry plus {
+    index: integer -- added only by Engine.AmmoRefill.FindByItemId
+}
+
+HealFriendAction = {
+    index: integer,
+    spellWords: string,
+    manaCost: integer,
+    itemId: integer,
+    healthPercentage: integer,
+    method: integer,
+    enabled: boolean
+}
+
+HealFriendVocationEntry = {
+    index: integer,
+    vocation: integer,
+    priority: integer,
+    enabled: boolean,
+    actions: HealFriendAction[]
+}
+
+HealFriendArea = {
+    spellWords: string,
+    manaCost: integer,
+    vocation: integer,
+    playersNeeded: integer,
+    healthPercentage: integer,
+    minimumHarmony: integer,
+    extended: boolean,
+    enabled: boolean,
+    knightRequired: boolean,
+    paladinRequired: boolean,
+    sorcererRequired: boolean,
+    druidRequired: boolean,
+    monkRequired: boolean
+}
+
+EquipmentManagerProfile = {
+    index: integer,
+    name: string,
+    active: boolean,
+    entryCount: integer
+}
+
+EquipmentCondition = {
+    type: integer,
+    monstersAround: integer,
+    playersAround: integer,
+    creaturesCount: integer,
+    targetName: string,
+    creatureNames: string
+}
+
+EquipmentManagerEntry = {
+    index: integer,
+    itemId: integer,
+    secondaryItemId: integer,
+    excludedItemIds: string,
+    excludedItemIdsEnabled: boolean,
+    tier: integer,
+    equipFromHotkey: boolean,
+    equipAction: boolean,
+    enabled: boolean,
+    delayMs: integer,
+    hasDelay: boolean,
+    useExtraConditions: boolean,
+    checkHealthRange: boolean,
+    checkManaRange: boolean,
+    healthManaOperator: integer,
+    minimumHealthPercentage: integer,
+    maximumHealthPercentage: integer,
+    minimumManaPercentage: integer,
+    maximumManaPercentage: integer,
+    keepEquipped: boolean,
+    keepEquippedMs: integer,
+    slot: integer,
+    conditionOperator: integer,
+    firstCondition: EquipmentCondition,
+    secondCondition: EquipmentCondition
+}
+
+AlarmsConfig = {
+    lowHealthPercentage: integer,
+    lowManaPercentage: integer,
+    flashWindow: boolean,
+    bringToFocus: boolean,
+    ignoreAllyPlayers: boolean,
+    gmCheckChatMessages: boolean,
+    damageTakenMinimum: integer,
+    damageTakenMaximum: integer,
+    playerAttackFilterMode: integer,
+    playerDetectedFilterMode: integer,
+    skullFilterMode: integer,
+    creatureDetectedNames: string,
+    alarmMessages: string,
+    playerAttackNames: string,
+    playerDetectedNames: string,
+    skullNames: string,
+    enemyNames: string,
+    gmNames: string
+}
+
+PVPTrashItem = {
+    index: integer,
+    itemId: integer,
+    quantity: integer
+}
+
+PVPConfig = {
+    holdTarget: boolean,
+    trashOnMouse: boolean,
+    antiPush: boolean,
+    killTarget: boolean,
+    magicWallKeeper: boolean,
+    wildGrowthKeeper: boolean,
+    previousSpotWall: boolean,
+    pushmax: boolean,
+    pushAttackedPlayer: boolean,
+    killTargetManaCost: integer,
+    killTargetHealthPercentage: integer,
+    killTargetSpellWords: string,
+    pushmaxDisintegrateRuneId: integer,
+    pushmaxNonDisintegrateRuneId: integer,
+    delayBetweenRuneAndPush: integer,
+    wallKeeperRuneIds: integer[],
+    wildGrowthKeeperRuneIds: integer[],
+    previousSpotRuneIds: integer[],
+    antiPushTrashItems: PVPTrashItem[],
+    mouseTrashItems: PVPTrashItem[]
+}
+```
+
+Important Healer distinction: add inputs use `healthpercent`, `manapercent`,
+`useonself`, and `useincontainer` without underscores. Getter snapshots use
+`health_percent`, `mana_percent`, `use_on_self`, and
+`use_in_container`. Generated scripts must not feed a getter's strings back to
+`AddSpell/AddItem` without translating them.
+
+Exact mappings include:
+
+- `Engine.TimerActions.GetEntries -> TimerActionEntry[]`;
+  `Engine.SuppliesSorter.GetEntries -> SuppliesSorterEntry[]`;
+  `Engine.Channels.GetEntries -> ChannelManagerEntry[]`.
+- `Engine.Conditions.GetSpells/GetHoldSpells -> ConditionSpellEntry[]`.
+- `Engine.Healer.GetSpells -> HealerSpellEntry[]` and
+  `GetSpellByIndex -> HealerSpellEntry|nil`; these native spell records do not
+  contain an `index`. `FindSpellByWords -> IndexedHealerSpellEntry|nil` adds
+  the matched 1-based index. Item list/find records use `HealerItemEntry` and
+  always include their index. Add calls accept their named input records and
+  return the new 1-based integer index, or `false` if the native feature is
+  unavailable. `ClearAllSpells/ClearAllItems -> boolean`.
+- `Engine.AmmoRefill.Get/GetAll -> AmmoRefillEntry|nil` and
+  `AmmoRefillEntry[]`; those native records do not include an index.
+  `FindByItemId -> IndexedAmmoRefillEntry|nil` adds the matched 1-based index.
+  Add accepts `AmmoRefillInput` and returns the new index or `false` when no
+  active profile/feature is available. `ClearAll -> boolean`. Current profile
+  is `ProfileSummary|nil` and profile names are `string[]`. `AddProfile ->
+  integer|false, string|nil` and `RenameProfile -> boolean, string|nil`; the
+  optional error string currently reports a duplicate profile name.
+- `Engine.HealFriend.GetVocations -> HealFriendVocationEntry[]` and
+  `GetArea -> HealFriendArea`.
+- `Engine.EquipmentManager.GetProfiles -> EquipmentManagerProfile[]` and
+  `GetEntries -> EquipmentManagerEntry[]`.
+- `Engine.Alarms.GetConfig -> AlarmsConfig`;
+  `Engine.PVPTools.GetConfig -> PVPConfig`.
+- `Engine.Equipment.GetSlotItem/GetAllSlotItems/GetSlotConstants/GetSnapshot`
+  use the same `EquipmentItem`, `EquipmentSlotConstants`, and
+  `InventorySnapshot` records documented above.
+
+```text
+ComboClientEntry = {
+    index: integer,
+    leaderName: string,
+    leaderSpellWords: string,
+    mySpellWords: string,
+    myRuneId: integer,
+    leaderAction: integer,
+    myAction: integer,
+    focusOption: integer,
+    shootType: integer,
+    range: integer,
+    enabled: boolean,
+    requiresTarget: boolean
+}
+
+ComboRoomEntry = {
+    index: integer,
+    leaderSpellWords: string,
+    mySpellWords: string,
+    leaderRuneId: integer,
+    myRuneId: integer,
+    leaderAction: integer,
+    myAction: integer,
+    equipMode: integer,
+    range: integer,
+    enabled: boolean,
+    requiresTarget: boolean
+}
+
+ComboRoomState = {
+    inRoom: boolean,
+    leader: boolean,
+    memberCount: integer,
+    roomId: string,
+    lastMessage: string,
+    leaderCharacterName: string,
+    memberNames: string[]
+}
+
+HudFeatureConfig = {
+    magicWallTimers: boolean,
+    xray: boolean,
+    targetingAnchor: boolean,
+    levelSpy: boolean,
+    magicWallIds: string,
+    wildGrowthIds: string,
+    timerColor: number[4] -- r,g,b,a normalized to 0..1
+}
+
+HudSpecialFoodCounter = {
+    index: integer,
+    itemId: integer,
+    delaySeconds: integer
+}
+
+MagicShooterEntry = {
+    index: integer,
+    enabled: boolean,
+    kind: "rune"|"spell",
+    actionType: "targetedSpell"|"areaRune"|"targetedRune"|"empowerment"|
+        "absoluteSpell"|"avatars"|"exetaChallenges"|"unknown",
+    range: integer,
+    option: integer,
+    condition: integer,
+    manaPercentage: integer,
+    healthPercentage: integer,
+    healthCondition: integer,
+    harmony?: integer,                  -- x64 only
+    harmonyCondition?: integer,         -- x64 only
+    monsterCount: integer,
+    monsterCountCondition: integer,
+    minimumMonsterHealthPercentage: integer,
+    maximumMonsterHealthPercentage: integer,
+    dangerLevel: integer,
+    customDelayMs: integer,
+    shootAfterWalkDelayMs: integer,
+    momentumDelayMs: integer,
+    meleeSkillIncreasePercentage: integer,
+    distanceSkillIncreasePercentage: integer,
+    requiresTarget: boolean,
+    pvpSafe: boolean,
+    shootOverAllies: boolean,
+    customSpell: boolean,
+    attackSkillBuffSpell: boolean,
+    dontCastWhileWalking: boolean,
+    prioritizeWithMomentum: boolean,
+    monsterNames: string,
+    castMethod: integer,
+    patternAnchor: integer,
+    patternSource: integer,
+    patternVariant: integer,
+    effectType: integer,
+    priorityLane: integer,
+    targetPolicy: integer,
+    hitCountMode: integer,
+    equipmentRequirement: integer,
+    trackedEffect: integer,
+    chainMaxTargets: integer,
+    chainJumpRange: integer,
+    chainSelector: integer,
+    patternId: string,
+    stanceGroup?: string,               -- x64 15.25+ only
+    stanceId?: string,                  -- x64 15.25+ only
+    forceUnknownStance?: boolean,        -- x64 15.25+ only
+    runeId?: integer,                   -- present when kind is rune
+    spellWords?: string                 -- present when kind is spell
+}
+
+TargetingEntry = {
+    index: integer,
+    monsterName: string,
+    monstersIgnoreList: string,
+    priority: integer,
+    dangerLevel: integer,
+    attackOption: integer,
+    keepDistanceOption: integer,
+    minimumHealthPercentage: integer,
+    maximumHealthPercentage: integer,
+    keepDistanceRange: integer,
+    anchoringRange: integer,
+    lootMonster: boolean,
+    stayDiagonal: boolean,
+    mustBeShootable: boolean,
+    mustBeReachable: boolean,
+    anchoring: boolean,
+    enabled: boolean
+}
+```
+
+`Engine.ComboBot.GetClientEntries -> ComboClientEntry[]`,
+`GetRoomEntries -> ComboRoomEntry[]`, and
+`GetRoomState -> ComboRoomState`. `Engine.HUD.GetConfig -> HudFeatureConfig`
+and `GetSpecialFoodCounters -> HudSpecialFoodCounter[]`.
+
+`Engine.MagicShooter.GetEntries(profile?) -> MagicShooterEntry[]|nil,
+string|nil`. On success the error is nil; on profile resolution failure the
+entry list is nil and the error explains why. Exactly one of `runeId` or
+`spellWords` is present according to `kind`. The harmony and stance fields
+are build-dependent and must be feature-detected. Active/current/next-profile
+getters return `ProfileSummary|nil`.
+
+`Engine.Targeting.GetEntries(profile?) -> TargetingEntry[]|nil`; its
+active/current/next-profile getters return `ProfileSummary|nil`.
+`Engine.Scripter.GetAvailableScripts/GetRunningScripts -> string[]`, while
+`GetOutput -> string`.
+
+### HUD parameter and getter records
+
+```text
+HudRenderLayer = "map"|"overlay"
+HudImageBytes = string | integer[]
+
+HudScreenTextParams = {
+    id: string,
+    text: string,
+    color?: ColorRGBA,
+    font_family?: string,
+    font_size?: integer,
+    render_layer?: HudRenderLayer,
+    h_align?: integer,
+    v_align?: integer,
+    is_draggable?: boolean,
+    is_clickable?: boolean,
+    on_click?: function(),
+    z_index?: integer,               -- zIndex is an accepted alias
+    enabled?: boolean
+}
+
+HudScreenImageParams = {
+    id: string,
+    source?: string,
+    source_base64?: string,
+    source_bytes?: HudImageBytes,
+    item_id?: integer,
+    item_name?: string,
+    width?: number,
+    height?: number,
+    source_width?: integer,
+    source_height?: integer,
+    opacity?: number,
+    smooth?: boolean,
+    label?: string,
+    label_color?: ColorRGBA,
+    label_offset_x?: number,
+    label_offset_y?: number,
+    render_layer?: HudRenderLayer,
+    h_align?: integer,
+    v_align?: integer,
+    is_draggable?: boolean,
+    is_clickable?: boolean,
+    on_click?: function(),
+    z_index?: integer,               -- zIndex is an accepted alias
+    enabled?: boolean
+}
+
+HudWorldTextParams = {
+    id: string,
+    x: integer,
+    y: integer,
+    z: integer,
+    text: string,
+    color?: ColorRGBA,
+    lifetime_ms?: integer,
+    font_family?: string,
+    font_size?: integer,
+    render_layer?: HudRenderLayer,
+    enabled?: boolean,
+    offset_x?: number,
+    offset_y?: number,
+    z_index?: integer                -- zIndex is an accepted alias
+}
+
+HudWorldImageParams = {
+    id: string,
+    x: integer,
+    y: integer,
+    z: integer,
+    source?: string,
+    source_base64?: string,
+    source_bytes?: HudImageBytes,
+    item_id?: integer,
+    item_name?: string,
+    width?: number,
+    height?: number,
+    source_width?: integer,
+    source_height?: integer,
+    opacity?: number,
+    smooth?: boolean,
+    label?: string,
+    label_color?: ColorRGBA,
+    label_offset_x?: number,
+    label_offset_y?: number,
+    render_layer?: HudRenderLayer,
+    lifetime_ms?: integer,
+    enabled?: boolean,
+    offset_x?: number,
+    offset_y?: number,
+    z_index?: integer                -- zIndex is an accepted alias
+}
+
+HudWorldBoxParams = {
+    id: string,
+    x: integer,
+    y: integer,
+    z: integer,
+    width?: number,
+    height?: number,
+    color?: ColorRGBA,
+    border_width?: number,
+    border_color?: ColorRGBA,
+    lifetime_ms?: integer,
+    render_layer?: HudRenderLayer,
+    enabled?: boolean,
+    z_index?: integer                -- zIndex is an accepted alias
+}
+
+HudImageLabelUpdate = {
+    id: string,
+    label?: string,
+    label_color?: ColorRGBA,
+    label_offset_x?: number,
+    label_offset_y?: number
+}
+
+HudWorldPositionUpdate = {
+    id: string,
+    x: integer,
+    y: integer,
+    z: integer
+}
+
+HudScreenPositionUpdate = {
+    id: string,
+    x: number,
+    y: number
+}
+
+HudScreenPosition = {
+    x: number,
+    y: number,
+    POS_X: number,                   -- exact compatibility alias of x
+    POS_Y: number,                   -- exact compatibility alias of y
+    POS_y: number                    -- exact legacy-case alias of y
+}
+```
+
+Image add records require exactly one source selector: `source`,
+`source_base64`, `source_bytes`, `item_id`, or `item_name`. When
+`is_clickable` is true, `on_click` is required. Click and drag-end callbacks
+are event critical paths: they take no arguments for clicks and
+`(x: number, y: number)` for drag-end, and must return immediately.
+
+`Engine.HUD.AddScreenText/AddScreenImage/AddWorldText/AddWorldImage/AddWorldBox`
+return the same validated parameter table supplied by the caller. Position,
+label, and color update calls return `nil`. The yielding HUD getters return
+`ColorRGBA`, `Position`, or `HudScreenPosition` exactly; they must never be
+called from an event/hook callback.
+
+The wrapper getters map as follows:
+
+- `ScreenText:GetColor`, `WorldText:GetColor`, and `WorldBox:GetColor` return
+  `ColorRGBA`.
+- `ScreenText:GetPosition` and `ScreenImage:GetPosition` return
+  `HudScreenPosition`, including all three compatibility aliases.
+- `WorldText:GetPosition`, `WorldBox:GetPosition`, and
+  `WorldImage:GetPosition` return `Position`.
+- Wrapper setters and `Create` return the same wrapper object for chaining;
+  `Remove -> nil`; boolean state getters return booleans; width and height
+  getters return numbers.
+
+### Persistent storage records
+
+```text
+StorageScope = private per-script logical namespace object
+SharedStorageScope = named cross-script namespace object
+
+SharedStorageChangeWriter = {
+    id: string,
+    name: string,
+    type: "script"|"walker"|"one_shot"|"unknown"
+}
+
+SharedStorageChangeEvent = {
+    namespace: string,
+    operation: "set"|"remove"|"clear",
+    scope: "global"|"character",
+    revision: integer,
+    timestampUnixMs: integer,
+    writer: SharedStorageChangeWriter,
+    character?: string,
+    key?: string,
+    previousExists: boolean,
+    newExists: boolean,
+    previousValueIncluded: boolean,
+    newValueIncluded: boolean,
+    previousValue?: JsonValue,
+    newValue?: JsonValue,
+    changedCount?: integer,
+    changedKeys?: string[],
+    changedKeysTruncated?: boolean,
+    valueOmissionReason?: string
+}
+```
+
+Set/remove events always include `key`. An unfiltered clear event instead
+includes `changedCount`, `changedKeys`, and `changedKeysTruncated`; a key-filtered
+clear includes that subscribed `key` and may include its previous value.
+`SharedStorageScope:OnChanged` takes
+`function(event: SharedStorageChangeEvent)` and returns
+`string|nil, string|nil` (`subscriptionId, errorMessage`). Its callback is an event
+critical path and must only hand minimal scalar state to the stable worker.
 
 ## Core Libraries Overview
 
@@ -825,18 +2585,90 @@ registrations:
 - `Events.GetScheduledEvents() -> string[]` returns this script's pending IDs.
 - `Events.CancelScheduledEvent(eventId) -> boolean` cancels a pending callback.
 - `Events.RegisterKeyEvent(options) -> string` registers a key callback and returns its opaque registration ID; use `Hotkeys.RegisterCombo` for normal combinations.
-- `Events.RegisterPacketEvent(options) -> string` accepts `id`, `packet_id` (one opcode or an array), `callback`, and optional `incoming` (default `true`), then returns its opaque registration ID.
+- `Events.RegisterPacketEvent(options) -> string` accepts `id`, `packet_id` (one opcode or an array), `callback`, and optional `incoming` (default `true`), then returns its opaque registration ID. For exactly one incoming `GAME_SERVER_TEXT_MESSAGE` opcode, a 1-1024-byte `message_contains` value adds a native literal substring filter before any per-packet Lua table or coroutine is allocated; optional `message_case_sensitive` defaults to `true`, and `false` uses ASCII case folding.
 - `Events.RegisterWalkerEvent(eventId, callback) -> integer|nil` returns a function reference for singular unregistration.
 - `Events.UnregisterKeyEvent(registrationId)`, `UnregisterPacketEvent(registrationId)`, and `UnregisterWalkerEvent(functionRef)` return booleans. Pass the exact opaque value returned at registration. A stale or foreign ID returns `false` and cannot remove another script's callback.
 - `Events.UnregisterAllKeyEvents()`, `UnregisterAllPacketEvents()`, and `UnregisterAllWalkerEvents()` remove this script's registrations.
 
+`Events.RegisterKeyEvent(options)` accepts exactly:
+
+- `id: string` (required, non-empty);
+- `keycode: integer` (required, 0..255);
+- `callback: function()` (required; receives no arguments);
+- `name?: string` (defaults to `id`);
+- `trigger_on_keydown?: boolean`, `shift?: boolean`, `ctrl?: boolean`,
+  and `extended?: boolean` (all default `false`).
+
+`Events.RegisterPacketEvent(options)` accepts exactly:
+
+- `id: string` (required, non-empty);
+- `packet_id: integer|integer[]` (required byte opcode or non-empty array);
+- `callback: function(packet: PacketEventPayload)` (required);
+- `incoming?: boolean` (default `true`);
+- `message_contains?: string` (1..1024 bytes; allowed only for exactly one
+  incoming text-message opcode);
+- `message_case_sensitive?: boolean` (default `true`; valid only with
+  `message_contains`).
+
+Only the following packet payloads are decoded in the current runtime. Field
+names are exact and case-sensitive:
+
+- Every decoded incoming payload: `opcode: integer`.
+- Incoming `GAME_SERVER_TEXT_MESSAGE`:
+  `{ opcode, message: string, message_class: integer }`.
+- Incoming talk:
+  `{ opcode, statement_id: integer, creature_name: string,
+  creature_message: string, position: Position, player_level: integer,
+  channel_id: integer, speak_type: integer, player_is_traded: boolean }`.
+- Incoming create-on-map:
+  `{ opcode, position: Position, stack_position: integer,
+  add_on_map_type: integer }`, plus either
+  `item_id: integer, item_count: integer` for an object or
+  `creature_id: integer, creature_name: string` for a creature.
+- Incoming delete-on-map:
+  `{ opcode, position: Position, stack_position: integer }`.
+- Incoming move-creature:
+  `{ opcode, creature_id: integer, old_position: Position,
+  new_position: Position, old_stack_position: integer }`.
+- Incoming full-map:
+  `{ opcode, update_position: Position, sqm_positions: PacketMapSquare[] }`.
+- Incoming top/right/bottom/left row:
+  `{ opcode, sqm_positions: PacketMapSquare[] }`.
+- `PacketMapSquare` is
+  `{ position: Position, item_ids: integer[] }`.
+- Incoming graphical-effect:
+  `{ opcode, effects: PacketGraphicalEffect[] }`, where each effect is
+  `{ from_position: Position, to_position: Position,
+  magic_effect_class: integer, shoot_type: integer,
+  tibia_effects_type: integer }`.
+- Incoming unjustified-points:
+  `{ opcode, full_kills_progress_in_day: integer,
+  full_kills_left_in_day: integer, full_kills_progress_in_week: integer,
+  full_kills_left_in_week: integer, full_kills_progress_in_month: integer,
+  full_kills_left_in_month: integer,
+  remaining_skull_time_in_days: integer }`.
+- Any other incoming opcode currently receives only `{ opcode: integer }`.
+- The only decoded outgoing payload is Client Look:
+  `{ position: Position, item_id: integer, stack_pos: integer }`.
+  Outgoing tables currently do **not** include `opcode`; every other outgoing
+  opcode currently receives an empty table.
+
+`IncomingOpcodeOnlyPacket = { opcode: integer }` names the fallback incoming
+record used by Appendix A. It has no other fields.
+
+Do not recursively search a packet for strings or guess camelCase aliases. For
+the AFK text-message example, read `packet.message` directly and use
+`message_contains` so irrelevant text packets never enter Lua.
+
 All registrations and scheduled callbacks are owned by the current script and
 are removed automatically when it stops. Scheduled callbacks run as managed
 coroutines and may yield. A scheduled callback failure ends only that callback.
-An event callback is disabled after exactly three consecutive uncaught failures;
-one successful terminal invocation resets its failure count. At most 64 event
-callbacks may be pending for a script, so callbacks should be short and should
-coalesce or discard replaceable telemetry rather than building a backlog.
+Registered event callbacks must instead obey the non-yielding critical-path
+rule. An event callback is disabled after exactly three consecutive uncaught
+failures; one successful terminal invocation resets its failure count. At most
+64 event callbacks may be active plus pending for a script. At the limit the
+newest callback is dropped, so callbacks must coalesce or deliberately discard
+replaceable telemetry instead of building a backlog.
 
 ### event_proxies.lua
 Event proxy wrappers for common game event categories.
@@ -870,6 +2702,16 @@ Callback arguments after `proxy`:
 - CreatureAddProxy: `creatureId, creatureName, position`
 - CreatureRemoveProxy: `creatureId`
 - DeathProxy: no additional arguments
+
+Current compatibility limitation: only the three text-message proxies above
+receive the fields they expect from the native serializer. Container
+open/close/add/update/remove, stats, skills, creature add/remove, and death
+opcodes are not decoded by the current packet serializer, so those proxy
+callbacks receive `nil`/empty values even though their historical callback
+signatures are listed. Generated scripts must treat those proxies as
+unavailable until the runtime adds matching payload decoders; do not invent
+their fields. Use the explicitly decoded direct `Events` payloads listed
+above when one matches the task.
 
 ### engine.lua
 The main high-level interface for querying and controlling configured bot features. Native state remains owned by the bot; Engine methods validate arguments and return Lua snapshots or operation results.
@@ -1337,9 +3179,12 @@ the notification while their existence flags remain accurate; the subscriber
 can call `Get` when it needs the large current value.
 
 Change callbacks are queued only after the storage lock is released and run as
-normal managed event coroutines. They may yield and may access storage safely.
-The standard event failure policy disables a subscription after three
-consecutive uncaught callback failures. Each script may own at most 64 shared
+managed event coroutines. Deadlock avoidance does not make storage access cheap:
+the callback must not yield or call storage again. Copy only the event's minimal
+scalar fields into a coalesced slot/bounded queue and let one stable worker
+batch any follow-up read or write. The standard event failure policy disables a
+subscription after three consecutive uncaught callback failures. Each script
+may own at most 64 shared
 storage subscriptions; the native notification queue is bounded to 32 events
 and 8 MiB, the process accepts at most 512 subscriptions, and callback fan-out
 is time-sliced to 128 admissions per manager pass. Remaining deliveries stay
@@ -1663,7 +3508,10 @@ Before finalizing any script, verify:
 6. Position/creature access handles invalid, despawned, or cross-floor objects safely.
 7. IDs, indexes, percentages, delays, and ranges are validated before mutation.
 8. Repeating modules are not hidden inside a blanket `pcall`; recoverable catches are narrow and logged.
-9. Callback work is bounded, event backlogs are avoided, and delays use monotonic time.
+9. Event/hook callbacks are constant-time and non-yielding: no wait, network,
+   storage/files, profile operations, large JSON, scans, pathfinding, retry
+   loops, or per-event scheduling. They only feed one stable worker through a
+   coalesced slot or hard-bounded queue.
 10. Detached getter snapshots are never edited as if they were live settings.
 11. Every accepted Walker defer token is completed or intentionally allowed to time out.
 12. `terminate()` is synchronous, non-yielding, fast, and restores any non-owner-scoped setting the script intentionally changed.
@@ -1707,34 +3555,53 @@ When generating ValidusBot Lua scripts:
 
 1. Use only exact APIs and enum names documented in this file and its generated appendix; never invent a getter, action, or generic update table.
 2. Prefer canonical core wrappers and `Engine.*` namespaces over compatibility globals or underscore-prefixed bindings.
-3. Include argument validation and nil/type checks for unavailable live state.
-4. Use Alt only with `Hotkeys.SendCombo`, never with callback registration.
-5. Never use or toggle the Objects Dumper or another internal/reserved feature.
-6. For repeated logic, use `Module.Every`; for one-shot work, use `Module.After` or `Events.Schedule`; all loops must yield.
-7. Keep callbacks small because Lua shares the game thread and is cooperatively budgeted.
-8. Do not blanket-`pcall` repeating modules. Catch only expected recoverable failures, log them, and preserve a useful fallback.
-9. Treat getter tables as snapshots and change bot state only through explicit setters/actions.
-10. Use `Time.MonotonicMs()` for elapsed time and `Storage` for JSON-compatible persistent script state.
-11. Put yieldable setup in `init()` and only fast, non-yielding cleanup in `terminate()`.
-12. Use stable owner-scoped names and emit explicit PASS/FAIL lines in diagnostic scripts.
-13. Return one complete runnable `.lua` file with concise comments and no TODO placeholders unless requested.
+3. For every named input, result, or callback record, read its definition under
+   `Canonical Types And Exact Table Contracts` and use only its case-sensitive
+   fields. Never guess aliases such as `item.id`, `item.slot`, or
+   `container.index`.
+4. Include argument validation and nil/type checks for unavailable live state.
+5. Use Alt only with `Hotkeys.SendCombo`, never with callback registration.
+6. Never use or toggle the Objects Dumper or another internal/reserved feature.
+7. For repeated logic, use `Module.Every`; for one-shot work, use `Module.After` or `Events.Schedule`; all loops must yield.
+8. Make every event/hook callback constant-time and non-yielding. It may only
+   copy minimal scalar fields into a coalesced slot or hard-bounded queue for one
+   pre-existing `Module.Every` worker. Never wait, perform network/storage/file
+   work, scan, pathfind, recursively traverse, or schedule one task per event.
+9. Do not blanket-`pcall` repeating modules. Catch only expected recoverable failures, log them, and preserve a useful fallback.
+10. Treat getter tables as snapshots and change bot state only through explicit setters/actions.
+11. Use `Time.MonotonicMs()` for elapsed time and `Storage` for JSON-compatible persistent script state.
+12. Put yieldable setup in `init()` and only fast, non-yielding cleanup in `terminate()`.
+13. Use stable owner-scoped names and emit explicit PASS/FAIL lines in diagnostic scripts.
+14. Return one complete runnable `.lua` file with concise comments and no TODO placeholders unless requested.
 
 ## LLM API-selection workflow
 
 For each requested behavior, an LLM should:
 
-1. Find the canonical signature in Appendix A and named constants in Appendix B.
-2. Prefer the highest-level matching wrapper (`Cavebot`, `Hotkeys`, `Cooldowns`, `Spells`, `Sound`, `Storage`, or a HUD class).
-3. Use `Engine.<Feature>` only for explicit feature configuration or actions, and call a setter rather than editing a getter snapshot.
-4. Decide whether the work is immediate, repeating, one-shot, or event-driven and choose `init`, `Module.Every`, `Module.After`/`Events.Schedule`, or an event proxy accordingly.
-5. Add capability checks for architecture/client-version-specific functions and nil checks for unavailable game state.
-6. Identify owner-scoped resources and any shared/live setting that must be restored in `terminate()`.
-7. Ensure errors remain observable, callbacks stay bounded, and validation/test output states PASS or FAIL explicitly.
+1. Find the canonical signature in Appendix A and named constants in
+   `lua_consts.lua` within that appendix.
+2. Resolve every named record in `Canonical Types And Exact Table Contracts`
+   before reading or constructing it; copy its field names exactly.
+3. Prefer the highest-level matching wrapper (`Cavebot`, `Hotkeys`, `Cooldowns`, `Spells`, `Sound`, `Storage`, or a HUD class).
+4. Use `Engine.<Feature>` only for explicit feature configuration or actions, and call a setter rather than editing a getter snapshot.
+5. Decide whether the work is immediate, repeating, one-shot, or event-driven and choose `init`, `Module.Every`, `Module.After`/`Events.Schedule`, or an event proxy accordingly.
+6. Add capability checks for architecture/client-version-specific functions and nil checks for unavailable game state.
+7. Identify owner-scoped resources and any shared/live setting that must be restored in `terminate()`.
+8. Ensure errors remain observable, callbacks stay bounded, and validation/test output states PASS or FAIL explicitly.
 
 ## Example Prompt for ChatGPT/Claude
 Use this prompt with this file attached:
 
-"Generate a production-safe ValidusBot Lua script using only exact APIs from the attached spec and its generated appendix. Script goal: <describe goal>. Prefer canonical high-level wrappers, validate live values, use managed yielding/scheduling, keep callbacks bounded, and let unexpected module errors reach the runtime. Use Alt only for synthetic SendCombo calls. Return one complete .lua file with explicit diagnostic logging and no invented APIs."
+"Generate a production-safe ValidusBot Lua script using only exact APIs from
+the attached spec and its generated appendix. Script goal: <describe goal>.
+Resolve every named table record and copy its case-sensitive fields exactly.
+Prefer canonical high-level wrappers, validate live values, and use managed
+yielding/scheduling. Every event/hook callback must be constant-time and
+non-yielding: never call Synchronize/main-thread helpers, lock, wait, perform
+network/storage work, or start one deferred task per event. Let unexpected
+module errors reach the runtime. Use Alt only for synthetic SendCombo calls.
+Return one complete .lua file with explicit diagnostic logging and no invented
+APIs."
 
 
 ---
@@ -1765,154 +3632,156 @@ The exact signatures below are authoritative. Avoid legacy generic update-table 
 Generated from `docs/Scripts/core`. It intentionally excludes local helpers, compatibility aliases, raw bindings, protocol details, and API-surface bootstrap internals. Use the canonical names below; if a function is absent, treat it as unavailable.
 
 ### cavebot.lua
-- `Cavebot.Defer(timeoutMs)`
-- `Cavebot.Disable()`
-- `Cavebot.DisableLure()`
-- `Cavebot.Enable()`
-- `Cavebot.EnableLure()`
-- `Cavebot.GetStatus()`
-- `Cavebot.GoTo(labelName)`
-- `Cavebot.GoToLabel(labelName)`
-- `Cavebot.InterceptAction(callback)`
-- `Cavebot.InterceptLabel(callback)`
-- `Cavebot.IsEnabled()`
-- `Cavebot.IsLureEnabled()`
-- `Cavebot.Lure.AddSetting(setting)`
-- `Cavebot.Lure.ClearSettings()`
-- `Cavebot.Lure.EndForceLure()`
-- `Cavebot.Lure.GetAttackWhileLuring()`
-- `Cavebot.Lure.GetConsiderOnlyReachable()`
-- `Cavebot.Lure.GetIgnoringMonsters()`
+- `Cavebot.Defer(timeoutMs: integer) -> CavebotDeferredHandle`
+- `Cavebot.Disable() -> nil`
+- `Cavebot.DisableLure() -> nil`
+- `Cavebot.Enable() -> nil`
+- `Cavebot.EnableLure() -> nil`
+- `Cavebot.GetStatus() -> CavebotStatus`
+- `Cavebot.GoTo(labelName: string) -> nil`
+- `Cavebot.GoToLabel(labelName: string) -> nil`
+- `Cavebot.InterceptAction(callback: function(actionName: string)) -> integer|nil`
+- `Cavebot.InterceptLabel(callback: function(labelName: string)) -> integer|nil`
+- `Cavebot.IsEnabled() -> boolean`
+- `Cavebot.IsLureEnabled() -> boolean`
+- `Cavebot.Load(path: string, features?: CavebotBundleFeatureSelection) -> boolean, string`
+- `Cavebot.Lure.AddSetting(setting: LureSettingInput) -> integer|false`
+- `Cavebot.Lure.ClearSettings() -> boolean`
+- `Cavebot.Lure.EndForceLure() -> boolean`
+- `Cavebot.Lure.GetAttackWhileLuring() -> boolean`
+- `Cavebot.Lure.GetConsiderOnlyReachable() -> boolean`
+- `Cavebot.Lure.GetIgnoringMonsters() -> boolean`
 - `Cavebot.Lure.GetKitingCloseMonsterCount() -> integer`
 - `Cavebot.Lure.GetKitingCloseMonsterDistance() -> integer`
 - `Cavebot.Lure.GetKitingMaximumFarthestDistance() -> integer`
 - `Cavebot.Lure.GetKitingPreferredFarthestDistance() -> integer`
-- `Cavebot.Lure.GetLuredCreaturesCount()`
-- `Cavebot.Lure.GetNearRange()`
-- `Cavebot.Lure.GetOption()`
-- `Cavebot.Lure.GetSettingCount()`
-- `Cavebot.Lure.GetSettings()`
-- `Cavebot.Lure.GetSlowWalkBurstSteps()`
-- `Cavebot.Lure.GetSlowWalkDelayMs()`
-- `Cavebot.Lure.GetSlowWalkingCreaturesCount()`
-- `Cavebot.Lure.GetStartEndLureActive()`
-- `Cavebot.Lure.GetState()`
-- `Cavebot.Lure.GetUnblocking()`
-- `Cavebot.Lure.GetWaypointDynamicLureActive()`
-- `Cavebot.Lure.HasActiveSettings()`
-- `Cavebot.Lure.IsEnabled()`
-- `Cavebot.Lure.IsFighting()`
-- `Cavebot.Lure.IsForceLure()`
-- `Cavebot.Lure.IsLuring()`
-- `Cavebot.Lure.IsOtherPlayerOnScreen()`
-- `Cavebot.Lure.RemoveSetting(index)`
-- `Cavebot.Lure.SetAttackWhileLuring(enabled)`
-- `Cavebot.Lure.SetConsiderOnlyReachable(enabled)`
-- `Cavebot.Lure.SetEnabled(enabled)`
-- `Cavebot.Lure.SetForceLure(enabled)`
-- `Cavebot.Lure.SetIgnoringMonsters(enabled)`
+- `Cavebot.Lure.GetLuredCreaturesCount() -> integer`
+- `Cavebot.Lure.GetNearRange() -> integer`
+- `Cavebot.Lure.GetOption() -> integer`
+- `Cavebot.Lure.GetSettingCount() -> integer`
+- `Cavebot.Lure.GetSettings() -> LureSetting[]`
+- `Cavebot.Lure.GetSlowWalkBurstSteps() -> integer`
+- `Cavebot.Lure.GetSlowWalkDelayMs() -> integer`
+- `Cavebot.Lure.GetSlowWalkingCreaturesCount() -> integer`
+- `Cavebot.Lure.GetStartEndLureActive() -> boolean`
+- `Cavebot.Lure.GetState() -> integer`
+- `Cavebot.Lure.GetUnblocking() -> boolean`
+- `Cavebot.Lure.GetWaypointDynamicLureActive() -> boolean`
+- `Cavebot.Lure.HasActiveSettings() -> boolean`
+- `Cavebot.Lure.IsEnabled() -> boolean`
+- `Cavebot.Lure.IsFighting() -> boolean`
+- `Cavebot.Lure.IsForceLure() -> boolean`
+- `Cavebot.Lure.IsLuring() -> boolean`
+- `Cavebot.Lure.IsOtherPlayerOnScreen() -> boolean`
+- `Cavebot.Lure.RemoveSetting(index: integer) -> boolean`
+- `Cavebot.Lure.SetAttackWhileLuring(enabled: boolean) -> boolean`
+- `Cavebot.Lure.SetConsiderOnlyReachable(enabled: boolean) -> boolean`
+- `Cavebot.Lure.SetEnabled(enabled: boolean) -> nil`
+- `Cavebot.Lure.SetForceLure(enabled: boolean) -> boolean`
+- `Cavebot.Lure.SetIgnoringMonsters(enabled: boolean) -> boolean`
 - `Cavebot.Lure.SetKitingCloseMonsterCount(count: integer) -> boolean`
 - `Cavebot.Lure.SetKitingCloseMonsterDistance(distance: integer) -> boolean`
 - `Cavebot.Lure.SetKitingMaximumFarthestDistance(distance: integer) -> boolean`
 - `Cavebot.Lure.SetKitingPreferredFarthestDistance(distance: integer) -> boolean`
-- `Cavebot.Lure.SetNearRange(range)`
-- `Cavebot.Lure.SetOption(option)`
-- `Cavebot.Lure.SetSlowWalkBurstSteps(steps)`
-- `Cavebot.Lure.SetSlowWalkDelayMs(delayMs)`
-- `Cavebot.Lure.SetSlowWalkingCreaturesCount(count)`
-- `Cavebot.Lure.SetStartEndLureActive(enabled)`
-- `Cavebot.Lure.SetUnblocking(enabled)`
-- `Cavebot.Lure.SetWaypointDynamicLureActive(enabled)`
-- `Cavebot.Lure.UpdateSetting(index, updateData)`
-- `Cavebot.ObserveAction(callback)`
-- `Cavebot.ObserveLabel(callback)`
-- `Cavebot.ObserveWaypointChange(callback)`
-- `Cavebot.OnAction(callback)`
-- `Cavebot.OnActionCompleted(callback)`
-- `Cavebot.OnActionStarted(callback)`
-- `Cavebot.OnLabel(callback)`
-- `Cavebot.OnWaypointChange(callback)`
-- `Cavebot.Pause(milliseconds, autoResume)`
-- `Cavebot.PrintStatus()`
-- `Cavebot.RegisterEvent(eventId, callback)`
-- `Cavebot.Resume()`
-- `Cavebot.SetEnabled(enabled)`
-- `Cavebot.SetEnginesEnabled(walkerEnabled, lureEnabled)`
-- `Cavebot.SetLureEnabled(enabled)`
-- `Cavebot.UnregisterAllEvents()`
-- `Cavebot.Walker.AddSpecialArea(area: table) -> integer|string|false`
-- `Cavebot.Walker.AddWaypoint(waypoint)`
-- `Cavebot.Walker.ClearSpecialAreas() -> boolean`
-- `Cavebot.Walker.ClearWaypoints()`
-- `Cavebot.Walker.CompleteDeferred(token)`
-- `Cavebot.Walker.Defer(timeoutMs)`
-- `Cavebot.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
-- `Cavebot.Walker.DeleteWaypoint(index)`
-- `Cavebot.Walker.GetAutoRecorderEnabled()`
-- `Cavebot.Walker.GetAutoRecorderOptions()`
-- `Cavebot.Walker.GetAutoExploreConnectorRecording() -> boolean`
-- `Cavebot.Walker.GetAutoExploreConnectors() -> table[]`
-- `Cavebot.Walker.GetAutoExploreSettings() -> table`
-- `Cavebot.Walker.GetAutoExploreStatus() -> table`
-- `Cavebot.Walker.GetNavigationMode() -> string`
-- `Cavebot.Walker.GetDebugHud()`
-- `Cavebot.Walker.GetDistanceBetweenWaypoints()`
-- `Cavebot.Walker.GetLeaveLureOnPlayer()`
-- `Cavebot.Walker.GetLeaveLurePlayerMode() -> integer`
-- `Cavebot.Walker.GetNodeDistance()`
-- `Cavebot.Walker.GetSelectedWaypointIndex()`
-- `Cavebot.Walker.GetSpecialAreaCount() -> integer`
-- `Cavebot.Walker.GetSpecialAreas() -> table[]`
-- `Cavebot.Walker.GetStartFromNearestWaypoint()`
-- `Cavebot.Walker.GetWalkToLureCenter()`
-- `Cavebot.Walker.GetWaypointCount()`
-- `Cavebot.Walker.GetWaypoints()`
-- `Cavebot.Walker.GoTo(labelName)`
-- `Cavebot.Walker.InsertWaypoint(index, waypoint)`
-- `Cavebot.Walker.IsEnabled()`
-- `Cavebot.Walker.IsPausedByLua()`
-- `Cavebot.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
-- `Cavebot.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
-- `Cavebot.Walker.IsStuck()`
-- `Cavebot.Walker.MoveWaypointDown(index)`
-- `Cavebot.Walker.MoveWaypointUp(index)`
-- `Cavebot.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
-- `Cavebot.Walker.ReplaceWaypoint(index, waypoint)`
-- `Cavebot.Walker.Resume()`
-- `Cavebot.Walker.SelectClosestWaypoint()`
-- `Cavebot.Walker.SetAutoRecorderEnabled(enabled)`
-- `Cavebot.Walker.SetAutoRecorderOptions(options)`
-- `Cavebot.Walker.AddAutoExploreConnector(connector: table) -> integer|string|false`
+- `Cavebot.Lure.SetNearRange(range: integer) -> boolean`
+- `Cavebot.Lure.SetOption(option: integer) -> boolean`
+- `Cavebot.Lure.SetSlowWalkBurstSteps(steps: integer) -> boolean`
+- `Cavebot.Lure.SetSlowWalkDelayMs(delayMs: integer) -> boolean`
+- `Cavebot.Lure.SetSlowWalkingCreaturesCount(count: integer) -> boolean`
+- `Cavebot.Lure.SetStartEndLureActive(enabled: boolean) -> boolean`
+- `Cavebot.Lure.SetUnblocking(enabled: boolean) -> boolean`
+- `Cavebot.Lure.SetWaypointDynamicLureActive(enabled: boolean) -> boolean`
+- `Cavebot.Lure.UpdateSetting(index: integer, updateData: LureSettingInput) -> boolean`
+- `Cavebot.ObserveAction(callback: function(actionName: string)) -> integer|nil`
+- `Cavebot.ObserveLabel(callback: function(labelName: string)) -> integer|nil`
+- `Cavebot.ObserveWaypointChange(callback: function(event: CavebotWaypointChangeEvent)) -> integer|nil`
+- `Cavebot.OnAction(callback: function(actionName: string)) -> integer|nil`
+- `Cavebot.OnActionCompleted(callback: function(event: CavebotActionCompletedEvent)) -> integer|nil`
+- `Cavebot.OnActionStarted(callback: function(event: CavebotActionStartedEvent)) -> integer|nil`
+- `Cavebot.OnLabel(callback: function(labelName: string)) -> integer|nil`
+- `Cavebot.OnWaypointChange(callback: function(event: CavebotWaypointChangeEvent)) -> integer|nil`
+- `Cavebot.Pause(milliseconds: integer, autoResume: boolean) -> string|nil`
+- `Cavebot.PrintStatus() -> nil`
+- `Cavebot.RegisterEvent(eventId: integer, callback: WalkerEventCallback) -> integer|nil`
+- `Cavebot.Resume() -> nil`
+- `Cavebot.Save(path: string, features?: CavebotBundleFeatureSelection) -> boolean, string`
+- `Cavebot.SetEnabled(enabled: boolean) -> nil`
+- `Cavebot.SetEnginesEnabled(walkerEnabled: boolean, lureEnabled: boolean) -> CavebotStatus`
+- `Cavebot.SetLureEnabled(enabled: boolean) -> nil`
+- `Cavebot.UnregisterAllEvents() -> boolean`
+- `Cavebot.Walker.AddAutoExploreConnector(connector?: WalkerAutoExploreConnectorInput) -> integer|string|false`
+- `Cavebot.Walker.AddSpecialArea(area: WalkerSpecialAreaInput) -> integer|string|false`
+- `Cavebot.Walker.AddWaypoint(waypoint: WalkerWaypointInput) -> integer|false`
 - `Cavebot.Walker.ClearAutoExploreConnectors() -> boolean`
+- `Cavebot.Walker.ClearSpecialAreas() -> boolean`
+- `Cavebot.Walker.ClearWaypoints() -> boolean`
+- `Cavebot.Walker.CompleteDeferred(token: integer) -> boolean`
+- `Cavebot.Walker.Defer(timeoutMs: integer) -> integer`
 - `Cavebot.Walker.DeleteAutoExploreConnector(id: integer|string) -> boolean`
+- `Cavebot.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
+- `Cavebot.Walker.DeleteWaypoint(index: integer) -> boolean`
+- `Cavebot.Walker.GetAutoExploreConnectorRecording() -> boolean`
+- `Cavebot.Walker.GetAutoExploreConnectors() -> WalkerAutoExploreConnector[]`
+- `Cavebot.Walker.GetAutoExploreSettings() -> WalkerAutoExploreSettings`
+- `Cavebot.Walker.GetAutoExploreStatus() -> WalkerAutoExploreStatus`
+- `Cavebot.Walker.GetAutoRecorderEnabled() -> boolean`
+- `Cavebot.Walker.GetAutoRecorderOptions() -> WalkerAutoRecorderOptions`
+- `Cavebot.Walker.GetDebugHud() -> boolean`
+- `Cavebot.Walker.GetDistanceBetweenWaypoints() -> integer`
+- `Cavebot.Walker.GetLeaveLureOnPlayer() -> boolean`
+- `Cavebot.Walker.GetLeaveLurePlayerMode() -> integer`
+- `Cavebot.Walker.GetNavigationMode() -> WalkerNavigationMode`
+- `Cavebot.Walker.GetNodeDistance() -> integer`
+- `Cavebot.Walker.GetSelectedWaypointIndex() -> integer|nil`
+- `Cavebot.Walker.GetSpecialAreaCount() -> integer`
+- `Cavebot.Walker.GetSpecialAreas() -> WalkerSpecialArea[]`
+- `Cavebot.Walker.GetStartFromNearestWaypoint() -> boolean`
+- `Cavebot.Walker.GetWalkToLureCenter() -> boolean`
+- `Cavebot.Walker.GetWaypointCount() -> integer`
+- `Cavebot.Walker.GetWaypoints() -> WalkerWaypoint[]`
+- `Cavebot.Walker.GoTo(labelName: string) -> nil`
+- `Cavebot.Walker.InsertWaypoint(index: integer, waypoint: WalkerWaypointInput) -> boolean`
+- `Cavebot.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
+- `Cavebot.Walker.IsEnabled() -> boolean`
+- `Cavebot.Walker.IsPausedByLua() -> boolean`
+- `Cavebot.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
+- `Cavebot.Walker.IsStuck() -> boolean`
+- `Cavebot.Walker.MoveWaypointDown(index: integer) -> boolean`
+- `Cavebot.Walker.MoveWaypointUp(index: integer) -> boolean`
+- `Cavebot.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
+- `Cavebot.Walker.ReplaceWaypoint(index: integer, waypoint: WalkerWaypointInput) -> boolean`
 - `Cavebot.Walker.ResetAutoExploreCoverage() -> boolean`
+- `Cavebot.Walker.Resume() -> nil`
+- `Cavebot.Walker.SelectClosestWaypoint() -> boolean`
 - `Cavebot.Walker.SetAutoExploreConnectorRecording(enabled: boolean) -> boolean`
-- `Cavebot.Walker.SetAutoExploreSettings(settings: table) -> boolean`
-- `Cavebot.Walker.SetNavigationMode(mode: string) -> boolean`
-- `Cavebot.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: table) -> boolean`
-- `Cavebot.Walker.SetDebugHud(enabled)`
-- `Cavebot.Walker.SetDistanceBetweenWaypoints(distance)`
-- `Cavebot.Walker.SetEnabled(enabled)`
-- `Cavebot.Walker.SetLeaveLureOnPlayer(enabled)`
+- `Cavebot.Walker.SetAutoExploreSettings(settings: WalkerAutoExploreSettingsPatch) -> boolean`
+- `Cavebot.Walker.SetAutoRecorderEnabled(enabled: boolean) -> boolean`
+- `Cavebot.Walker.SetAutoRecorderOptions(options: WalkerAutoRecorderOptionsPatch) -> boolean`
+- `Cavebot.Walker.SetDebugHud(enabled: boolean) -> boolean`
+- `Cavebot.Walker.SetDistanceBetweenWaypoints(distance: integer) -> boolean`
+- `Cavebot.Walker.SetEnabled(enabled: boolean) -> nil`
+- `Cavebot.Walker.SetLeaveLureOnPlayer(enabled: boolean) -> boolean`
 - `Cavebot.Walker.SetLeaveLurePlayerMode(mode: integer) -> boolean`
-- `Cavebot.Walker.SetNodeDistance(distance)`
-- `Cavebot.Walker.SetPausedByLua(paused)`
-- `Cavebot.Walker.SetSelectedWaypointIndex(index)`
-- `Cavebot.Walker.SetStartFromNearestWaypoint(enabled)`
-- `Cavebot.Walker.SetWalkToLureCenter(enabled)`
+- `Cavebot.Walker.SetNavigationMode(mode: "waypoints"|"auto_explore") -> boolean`
+- `Cavebot.Walker.SetNodeDistance(distance: integer) -> boolean`
+- `Cavebot.Walker.SetPausedByLua(paused: boolean) -> boolean`
+- `Cavebot.Walker.SetSelectedWaypointIndex(index: integer) -> boolean`
+- `Cavebot.Walker.SetStartFromNearestWaypoint(enabled: boolean) -> boolean`
+- `Cavebot.Walker.SetWalkToLureCenter(enabled: boolean) -> boolean`
 - `Cavebot.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
-- `Cavebot.Walker.UpdateSpecialArea(id: integer|string, updateData: table) -> boolean`
+- `Cavebot.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: WalkerAutoExploreConnectorPatch) -> boolean`
+- `Cavebot.Walker.UpdateSpecialArea(id: integer|string, updateData: WalkerSpecialAreaPatch) -> boolean`
 
 ### cavebot_actions.lua
-- `Cavebot.Actions.GetLastResult()`
-- `Cavebot.Actions.Register(actionType, handler)`
-- `Cavebot.Actions.Run(context)`
+- `Cavebot.Actions.GetLastResult() -> CavebotActionResult|nil`
+- `Cavebot.Actions.Register(actionType: string, handler: function(context: CavebotActionContext) -> CavebotActionResult) -> boolean`
+- `Cavebot.Actions.Run(context: CavebotActionContext) -> CavebotActionResult`
 
 ### chat_channel.lua
-- `ChatChannel.FromIdentifier(identifier: any) -> table|nil`
-- `ChatChannel.GetById(channelId: integer) -> table|nil`
-- `ChatChannel.GetByName(channelName: string) -> table|nil`
-- `ChatChannel.New(channelOrId: table|integer, channelName?: string) -> table`
+- `ChatChannel.FromIdentifier(identifier: ChatChannelIdentifier) -> ChatChannel|nil`
+- `ChatChannel.GetById(channelId: integer) -> ChatChannel|nil`
+- `ChatChannel.GetByName(channelName: string) -> ChatChannel|nil`
+- `ChatChannel.New(channelOrId: ChatChannelInput|integer, channelName?: string) -> ChatChannel`
 - `ChatChannel:CanSend() -> boolean`
 - `ChatChannel:GetId() -> integer`
 - `ChatChannel:GetName() -> string`
@@ -1923,49 +3792,49 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `ChatChannel:Refresh() -> boolean`
 - `ChatChannel:Send(message: string) -> boolean`
 - `ChatChannel:ToString() -> string`
-- `ChatChannel:ToTable() -> table`
+- `ChatChannel:ToTable() -> ChatChannelRecord`
 
 ### chat_channel_storage.lua
-- `ChatChannelStorage.CanSend(channelIdentifier: any) -> boolean`
-- `ChatChannelStorage.FormatChannel(channel: table) -> string`
+- `ChatChannelStorage.CanSend(channelIdentifier: ChatChannelIdentifier) -> boolean`
+- `ChatChannelStorage.FormatChannel(channel: ChatChannelRecord) -> string`
 - `ChatChannelStorage.GetChannelNames(onlySendable?: boolean) -> string[]`
-- `ChatChannelStorage.GetChatChannelById(channelId: integer) -> table|nil`
-- `ChatChannelStorage.GetChatChannelByName(channelName: string) -> table|nil`
+- `ChatChannelStorage.GetChatChannelById(channelId: integer) -> ChatChannelRecord|nil`
+- `ChatChannelStorage.GetChatChannelByName(channelName: string) -> ChatChannelRecord|nil`
 - `ChatChannelStorage.GetChatChannelCount() -> integer`
-- `ChatChannelStorage.GetChatChannels() -> table[]`
-- `ChatChannelStorage.GetLocalChatChannel() -> table|nil`
+- `ChatChannelStorage.GetChatChannels() -> ChatChannelRecord[]`
+- `ChatChannelStorage.GetLocalChatChannel() -> ChatChannelRecord|nil`
 - `ChatChannelStorage.GetOpenedChannelCount() -> integer`
-- `ChatChannelStorage.GetOpenedChannels() -> table[]`
-- `ChatChannelStorage.GetServerLogChannel() -> table|nil`
-- `ChatChannelStorage.GetSnapshot() -> table`
+- `ChatChannelStorage.GetOpenedChannels() -> ChatChannelRecord[]`
+- `ChatChannelStorage.GetServerLogChannel() -> ChatChannelRecord|nil`
+- `ChatChannelStorage.GetSnapshot() -> ChatChannelStorageSnapshot`
 - `ChatChannelStorage.HasChannelById(channelId: integer) -> boolean`
 - `ChatChannelStorage.HasChannelByName(channelName: string) -> boolean`
 - `ChatChannelStorage.IsAvailable() -> boolean`
-- `ChatChannelStorage.ResolveChannel(channelIdentifier: any) -> table|nil`
-- `ChatChannelStorage.Send(message: string, channelIdentifier: any) -> boolean`
-- `ChatChannelStorage.ToIdLookupTable() -> table`
-- `ChatChannelStorage.ToNameLookupTable() -> table`
+- `ChatChannelStorage.ResolveChannel(channelIdentifier: ChatChannelIdentifier) -> ChatChannelRecord|nil`
+- `ChatChannelStorage.Send(message: string, channelIdentifier: ChatChannelIdentifier) -> boolean`
+- `ChatChannelStorage.ToIdLookupTable() -> table<integer, ChatChannelRecord>`
+- `ChatChannelStorage.ToNameLookupTable() -> table<string, ChatChannelRecord>`
 
 ### container.lua
-- `Container.FindItem(containerNumber: integer, itemId: integer, tierLevel?: integer) -> table|nil`
-- `Container.FindItemInOpenContainers(itemId: integer, tierLevel?: integer) -> table|nil`
-- `Container.GetById(containerId: integer) -> table|nil`
-- `Container.GetByName(containerName: string) -> table|nil`
-- `Container.GetByNumber(containerNumber: integer) -> table|nil`
+- `Container.FindItem(containerNumber: integer, itemId: integer, tierLevel?: integer) -> ContainerFindResult|nil`
+- `Container.FindItemInOpenContainers(itemId: integer, tierLevel?: integer) -> ContainerFindResult|nil`
+- `Container.GetById(containerId: integer) -> ContainerSnapshot|nil`
+- `Container.GetByName(containerName: string) -> ContainerSnapshot|nil`
+- `Container.GetByNumber(containerNumber: integer) -> ContainerSnapshot|nil`
 - `Container.GetFreeSlots(containerNumber: integer) -> integer|nil`
 - `Container.GetId(containerNumber: integer) -> integer|nil`
-- `Container.GetItem(containerNumber: integer, slotIndex: integer) -> table|nil`
-- `Container.GetItems(containerNumber: integer) -> table[]`
+- `Container.GetItem(containerNumber: integer, slotIndex: integer) -> ContainerItem|nil`
+- `Container.GetItems(containerNumber: integer) -> ContainerItem[]`
 - `Container.GetItemsCount(containerNumber: integer) -> integer|nil`
 - `Container.GetName(containerNumber: integer) -> string|nil`
-- `Container.GetOpenContainers() -> table[]`
+- `Container.GetOpenContainers() -> ContainerSummary[]`
 - `Container.GetSize(containerNumber: integer) -> integer|nil`
-- `Container.LookItem(itemId: integer, itemPos: integer, containerIndex: integer) -> any`
-- `Container.MoveItemFromEquipmentToContainer(equipmentSlot: integer, containerIndex: integer, slotIndex: integer, itemId: integer, itemCount: integer) -> any`
-- `Container.MoveItemToContainer(fromContainerIndex: integer, fromSlotIndex: integer, itemId: integer, toContainerIndex: integer, toSlotIndex: integer, itemCount: integer) -> any`
-- `Container.MoveItemToEquipment(containerIndex: integer, slotIndex: integer, itemId: integer, equipmentSlot: integer, itemCount: integer) -> any`
-- `Container.MoveItemToFloor(containerIndex: integer, slotIndex: integer, itemId: integer, toPosition: table, itemCount: integer) -> any`
-- `Container.UseItem(itemId: integer, containerIndex: integer, itemPos: integer, useItemWithHotkey?: boolean) -> any`
+- `Container.LookItem(itemId: integer, itemPos: integer, containerIndex: integer) -> boolean`
+- `Container.MoveItemFromEquipmentToContainer(equipmentSlot: integer, containerIndex: integer, slotIndex: integer, itemId: integer, itemCount: integer) -> boolean`
+- `Container.MoveItemToContainer(fromContainerIndex: integer, fromSlotIndex: integer, itemId: integer, toContainerIndex: integer, toSlotIndex: integer, itemCount: integer) -> boolean`
+- `Container.MoveItemToEquipment(containerIndex: integer, slotIndex: integer, itemId: integer, equipmentSlot: integer, itemCount: integer) -> boolean`
+- `Container.MoveItemToFloor(containerIndex: integer, slotIndex: integer, itemId: integer, toPosition: PositionLike, itemCount: integer) -> boolean`
+- `Container.UseItem(itemId: integer, containerIndex: integer, itemPos: integer, useItemWithHotkey?: boolean) -> boolean`
 
 ### cooldowns.lua
 - `Cooldowns.Group.GetTimeLeft(groupId: integer) -> integer`
@@ -1983,31 +3852,31 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Cooldowns.UseWith.IsExhausted() -> boolean`
 - `Cooldowns.UseWith.IsReady() -> boolean`
 - `Cooldowns.Utils.FormatTime(ms: number) -> string`
-- `Cooldowns.Utils.GetStatus(spells?: string[]) -> table`
-- `Cooldowns.Utils.PrintStatus(spells?: string[])`
+- `Cooldowns.Utils.GetStatus(spells?: string[]) -> CooldownStatus`
+- `Cooldowns.Utils.PrintStatus(spells?: string[]) -> nil`
 
 ### creature.lua
 - `Creature.GetFollowed() -> Creature|nil`
 - `Creature.GetLocalPlayer() -> Creature|nil`
 - `Creature.GetTarget() -> Creature|nil`
-- `Creature:ClearCache()`
-- `Creature:DistanceTo(targetPos: table) -> number`
-- `Creature:DistanceToCreature(otherCreature: Creature) -> number`
+- `Creature:ClearCache() -> nil`
+- `Creature:DistanceTo(targetPos: PositionLike) -> integer`
+- `Creature:DistanceToCreature(otherCreature: Creature) -> integer`
 - `Creature:Equals(other: Creature) -> boolean`
-- `Creature:GetDirection() -> number`
-- `Creature:GetGuildShield() -> number`
-- `Creature:GetHealthPercent() -> number`
-- `Creature:GetId() -> number`
+- `Creature:GetDirection() -> integer`
+- `Creature:GetGuildShield() -> integer`
+- `Creature:GetHealthPercent() -> integer`
+- `Creature:GetId() -> integer`
 - `Creature:GetLowercaseName() -> string`
-- `Creature:GetMasterId() -> number`
+- `Creature:GetMasterId() -> integer`
 - `Creature:GetName() -> string`
-- `Creature:GetOutfit() -> table`
-- `Creature:GetPartyShield() -> number`
-- `Creature:GetPosition() -> table`
-- `Creature:GetSkull() -> number`
-- `Creature:GetSpeed() -> number`
-- `Creature:GetVocation() -> number`
-- `Creature:IsAdjacentTo(targetPos: table) -> boolean`
+- `Creature:GetOutfit() -> CreatureOutfit`
+- `Creature:GetPartyShield() -> integer`
+- `Creature:GetPosition() -> Position`
+- `Creature:GetSkull() -> integer`
+- `Creature:GetSpeed() -> integer`
+- `Creature:GetVocation() -> integer`
+- `Creature:IsAdjacentTo(targetPos: PositionLike) -> boolean`
 - `Creature:IsGameMaster() -> boolean`
 - `Creature:IsInGuild() -> boolean`
 - `Creature:IsInParty() -> boolean`
@@ -2017,7 +3886,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Creature:IsPartyLeader() -> boolean`
 - `Creature:IsPlayer() -> boolean`
 - `Creature:IsReachable() -> boolean`
-- `Creature:IsSameFloor(targetPos: table) -> boolean`
+- `Creature:IsSameFloor(targetPos: PositionLike) -> boolean`
 - `Creature:IsShootable() -> boolean`
 - `Creature:IsSkulled() -> boolean`
 - `Creature:IsSummon() -> boolean`
@@ -2025,48 +3894,48 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Creature:IsVisible() -> boolean`
 - `Creature:IsWarAlly() -> boolean`
 - `Creature:IsWarEnemy() -> boolean`
-- `Creature:New(creatureId: number) -> Creature`
+- `Creature:New(creatureId: integer) -> Creature`
 - `Creature:ToString() -> string`
 
 ### creature_iterators.lua
-- `Creature.ICreatures() -> function`
-- `Creature.IMonsters() -> function`
-- `Creature.INpcs() -> function`
-- `Creature.IPlayers() -> function`
+- `Creature.ICreatures() -> CreatureIterator`
+- `Creature.IMonsters() -> CreatureIterator`
+- `Creature.INpcs() -> CreatureIterator`
+- `Creature.IPlayers() -> CreatureIterator`
 - `Creatures.GetAttackingCreatureId() -> integer|nil`
-- `Creatures.GetCreatureByName(creatureName: string) -> table|nil`
+- `Creatures.GetCreatureByName(creatureName: string) -> Creature|nil`
 - `Creatures.GetCreatureIdsByScan(typeFlags?: integer, xRelativeDistance?: integer, yRelativeDistance?: integer, multifloor?: boolean, ignoreSummons?: boolean) -> integer[]`
-- `Creatures.GetCreaturesByScan(typeFlags?: integer, xRelativeDistance?: integer, yRelativeDistance?: integer, multifloor?: boolean, ignoreSummons?: boolean) -> table[]`
+- `Creatures.GetCreaturesByScan(typeFlags?: integer, xRelativeDistance?: integer, yRelativeDistance?: integer, multifloor?: boolean, ignoreSummons?: boolean) -> Creature[]`
 - `Creatures.GetFollowingCreatureId() -> integer|nil`
 - `Creatures.GetLocalPlayerId() -> integer|nil`
 - `Creatures.GetPlayerIdUnderMouse() -> integer|nil`
 - `Creatures.GetVisibleCreatureIds() -> integer[]`
-- `Creatures.GetVisibleCreatures() -> table[]`
-- `Creatures.GetVisibleMonsters(ignoreSummons?: boolean) -> table[]`
-- `Creatures.GetVisibleNpcs() -> table[]`
-- `Creatures.GetVisiblePlayers() -> table[]`
+- `Creatures.GetVisibleCreatures() -> Creature[]`
+- `Creatures.GetVisibleMonsters(ignoreSummons?: boolean) -> Creature[]`
+- `Creatures.GetVisibleNpcs() -> Creature[]`
+- `Creatures.GetVisiblePlayers() -> Creature[]`
 - `Creatures.IsCreatureOnScreen(creatureId: integer, xRelativeDistance?: integer, yRelativeDistance?: integer, multifloor?: boolean) -> boolean`
 
 ### engine.lua
-- `Engine.Alarms.Disable(alarmId: number) -> boolean`
+- `Engine.Alarms.Disable(alarmId: integer) -> boolean`
 - `Engine.Alarms.DisableAll() -> nil`
-- `Engine.Alarms.Enable(alarmId: number) -> boolean`
+- `Engine.Alarms.Enable(alarmId: integer) -> boolean`
 - `Engine.Alarms.EnableAll() -> nil`
-- `Engine.Alarms.EnableOnly(alarmIdsList: table) -> nil`
-- `Engine.Alarms.GetConfig() -> table`
+- `Engine.Alarms.EnableOnly(alarmIdsList: integer[]) -> nil`
+- `Engine.Alarms.GetConfig() -> AlarmsConfig`
 - `Engine.Alarms.GetCreatureFilter() -> string`
-- `Engine.Alarms.GetLowHealthThreshold() -> number`
-- `Engine.Alarms.GetLowManaThreshold() -> number`
+- `Engine.Alarms.GetLowHealthThreshold() -> integer`
+- `Engine.Alarms.GetLowManaThreshold() -> integer`
 - `Engine.Alarms.GetMessageFilter() -> string`
 - `Engine.Alarms.IsBringToFocusEnabled() -> boolean`
-- `Engine.Alarms.IsEnabled(alarmId: number) -> boolean`
+- `Engine.Alarms.IsEnabled(alarmId: integer) -> boolean`
 - `Engine.Alarms.IsFlashWindowEnabled() -> boolean`
 - `Engine.Alarms.IsIgnoringAllyPlayers() -> boolean`
 - `Engine.Alarms.PrintStatus() -> nil`
-- `Engine.Alarms.SetAlarmMessages(messages: any) -> boolean`
+- `Engine.Alarms.SetAlarmMessages(messages: string) -> boolean`
 - `Engine.Alarms.SetBringToFocus(enabled: boolean) -> boolean`
 - `Engine.Alarms.SetBringToFocusEnabled(value: boolean) -> boolean`
-- `Engine.Alarms.SetCreatureDetectedNames(names: any) -> boolean`
+- `Engine.Alarms.SetCreatureDetectedNames(names: string) -> boolean`
 - `Engine.Alarms.SetCreatureFilter(namesString: string) -> boolean`
 - `Engine.Alarms.SetDamageTakenRange(minimumDamage: integer, maximumDamage: integer) -> boolean`
 - `Engine.Alarms.SetEnemyNames(value: string) -> boolean`
@@ -2074,11 +3943,11 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Alarms.SetFlashWindowEnabled(value: boolean) -> boolean`
 - `Engine.Alarms.SetGmChatCheckEnabled(value: boolean) -> boolean`
 - `Engine.Alarms.SetGmNames(value: string) -> boolean`
-- `Engine.Alarms.SetIgnoreAllyPlayers(ignore: any) -> boolean`
-- `Engine.Alarms.SetLowHealthPercentage(arg1: any) -> boolean`
-- `Engine.Alarms.SetLowHealthThreshold(percentage: number) -> boolean`
-- `Engine.Alarms.SetLowManaPercentage(arg1: any) -> boolean`
-- `Engine.Alarms.SetLowManaThreshold(percentage: number) -> boolean`
+- `Engine.Alarms.SetIgnoreAllyPlayers(ignore: boolean) -> boolean`
+- `Engine.Alarms.SetLowHealthPercentage(arg1: integer) -> boolean`
+- `Engine.Alarms.SetLowHealthThreshold(percentage: integer) -> boolean`
+- `Engine.Alarms.SetLowManaPercentage(arg1: integer) -> boolean`
+- `Engine.Alarms.SetLowManaThreshold(percentage: integer) -> boolean`
 - `Engine.Alarms.SetMessageFilter(messagesString: string) -> boolean`
 - `Engine.Alarms.SetPlayerAttackFilterMode(value: integer) -> boolean`
 - `Engine.Alarms.SetPlayerAttackNames(value: string) -> boolean`
@@ -2086,36 +3955,36 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Alarms.SetPlayerDetectedNames(value: string) -> boolean`
 - `Engine.Alarms.SetSkullFilterMode(value: integer) -> boolean`
 - `Engine.Alarms.SetSkullNames(value: string) -> boolean`
-- `Engine.Alarms.Toggle(alarmId: number) -> boolean`
-- `Engine.AmmoRefill.Add(ammoData: table) -> number`
-- `Engine.AmmoRefill.AddProfile(profileName: string|nil) -> number|boolean`
-- `Engine.AmmoRefill.ClearAll() -> nil`
-- `Engine.AmmoRefill.Disable(index: number) -> boolean`
+- `Engine.Alarms.Toggle(alarmId: integer) -> boolean`
+- `Engine.AmmoRefill.Add(ammoData: AmmoRefillInput) -> integer|false`
+- `Engine.AmmoRefill.AddProfile(profileName: string|nil) -> integer|false, string|nil`
+- `Engine.AmmoRefill.ClearAll() -> boolean`
+- `Engine.AmmoRefill.Disable(index: integer) -> boolean`
 - `Engine.AmmoRefill.DisableAll() -> nil`
-- `Engine.AmmoRefill.Enable(index: number) -> boolean`
+- `Engine.AmmoRefill.Enable(index: integer) -> boolean`
 - `Engine.AmmoRefill.EnableAll() -> nil`
-- `Engine.AmmoRefill.EnableOnly(itemIdsList: table) -> nil`
-- `Engine.AmmoRefill.FindByItemId(itemId: number) -> table|nil`
-- `Engine.AmmoRefill.FindProfileByName(profileName: string) -> number|nil`
-- `Engine.AmmoRefill.Get(index: number) -> table|nil`
-- `Engine.AmmoRefill.GetAll() -> table`
-- `Engine.AmmoRefill.GetCurrentProfile() -> table|nil`
-- `Engine.AmmoRefill.GetProfileNames() -> table`
+- `Engine.AmmoRefill.EnableOnly(itemIdsList: integer[]) -> nil`
+- `Engine.AmmoRefill.FindByItemId(itemId: integer) -> IndexedAmmoRefillEntry|nil`
+- `Engine.AmmoRefill.FindProfileByName(profileName: string) -> integer|nil`
+- `Engine.AmmoRefill.Get(index: integer) -> AmmoRefillEntry|nil`
+- `Engine.AmmoRefill.GetAll() -> AmmoRefillEntry[]`
+- `Engine.AmmoRefill.GetCurrentProfile() -> ProfileSummary|nil`
+- `Engine.AmmoRefill.GetProfileNames() -> string[]`
 - `Engine.AmmoRefill.PrintProfiles() -> nil`
 - `Engine.AmmoRefill.PrintStatus() -> nil`
-- `Engine.AmmoRefill.Remove(index: number) -> boolean`
-- `Engine.AmmoRefill.RemoveProfile(indexOrName: number|string) -> boolean`
-- `Engine.AmmoRefill.RenameProfile(indexOrName: number|string, newName: string) -> boolean`
+- `Engine.AmmoRefill.Remove(index: integer) -> boolean`
+- `Engine.AmmoRefill.RemoveProfile(indexOrName: integer|string) -> boolean`
+- `Engine.AmmoRefill.RenameProfile(indexOrName: integer|string, newName: string) -> boolean, string|nil`
 - `Engine.AmmoRefill.SetEntryEnabled(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.AmmoRefill.SetEntryEquipFromHotkey(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.AmmoRefill.SetEntryItemId(entryIndex: integer, value: integer) -> boolean`
 - `Engine.AmmoRefill.SetEntryRefillLeftHand(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.AmmoRefill.SetEntryThreshold(entryIndex: integer, value: integer) -> boolean`
-- `Engine.AmmoRefill.SetProfile(indexOrName: number|string) -> boolean`
-- `Engine.AmmoRefill.Toggle(index: number) -> boolean|nil`
+- `Engine.AmmoRefill.SetProfile(indexOrName: integer|string) -> boolean`
+- `Engine.AmmoRefill.Toggle(index: integer) -> boolean|nil`
 - `Engine.Channels.AddEntry(name: string, message: string, intervalSeconds: integer, channelId: integer, talkAction: integer, enabled: boolean|nil) -> integer`
 - `Engine.Channels.ClearEntries() -> boolean`
-- `Engine.Channels.GetEntries() -> table[]`
+- `Engine.Channels.GetEntries() -> ChannelManagerEntry[]`
 - `Engine.Channels.GetGlobalDelay() -> integer`
 - `Engine.Channels.RemoveEntry(index: integer) -> boolean`
 - `Engine.Channels.SetEntryChannelId(entryIndex: integer, value: integer) -> boolean`
@@ -2125,10 +3994,10 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Channels.SetEntryName(entryIndex: integer, value: string) -> boolean`
 - `Engine.Channels.SetEntryTalkAction(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Channels.SetGlobalDelay(value: integer) -> boolean`
-- `Engine.ComboBot.GetClientEntries() -> table[]`
+- `Engine.ComboBot.GetClientEntries() -> ComboClientEntry[]`
 - `Engine.ComboBot.GetMode() -> integer`
-- `Engine.ComboBot.GetRoomEntries() -> table[]`
-- `Engine.ComboBot.GetRoomState() -> table`
+- `Engine.ComboBot.GetRoomEntries() -> ComboRoomEntry[]`
+- `Engine.ComboBot.GetRoomState() -> ComboRoomState`
 - `Engine.ComboBot.SetClientEntryEnabled(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.ComboBot.SetClientEntryFocusOption(entryIndex: integer, value: integer) -> boolean`
 - `Engine.ComboBot.SetClientEntryLeaderAction(entryIndex: integer, value: integer) -> boolean`
@@ -2152,12 +4021,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.ComboBot.SetRoomEntryRange(entryIndex: integer, value: integer) -> boolean`
 - `Engine.ComboBot.SetRoomEntryRequiresTarget(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.Conditions.GetCastInProtectionZoneEnabled() -> boolean`
-- `Engine.Conditions.GetHoldSpells() -> table[]`
+- `Engine.Conditions.GetHoldSpells() -> ConditionSpellEntry[]`
 - `Engine.Conditions.GetManaShieldDelay() -> integer`
 - `Engine.Conditions.GetManaShieldTimerBased() -> integer`
 - `Engine.Conditions.GetRecoverySpellDelay() -> integer`
 - `Engine.Conditions.GetRecoverySpellTimerBased() -> integer`
-- `Engine.Conditions.GetSpells() -> table[]`
+- `Engine.Conditions.GetSpells() -> ConditionSpellEntry[]`
 - `Engine.Conditions.GetUseHasteWithSharpShooterEnabled() -> boolean`
 - `Engine.Conditions.SetCastInProtectionZoneEnabled(value: boolean) -> boolean`
 - `Engine.Conditions.SetHoldSpellEnabled(entryIndex: integer, value: boolean) -> boolean`
@@ -2236,18 +4105,18 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Equipment.CanMove() -> boolean`
 - `Engine.Equipment.CanRead() -> boolean`
 - `Engine.Equipment.Equip(itemId: integer, tierLevel?: integer) -> boolean`
-- `Engine.Equipment.GetAllSlotItems() -> table`
-- `Engine.Equipment.GetSlotConstants() -> table`
+- `Engine.Equipment.GetAllSlotItems() -> table<integer, EquipmentItem>`
+- `Engine.Equipment.GetSlotConstants() -> EquipmentSlotConstants`
 - `Engine.Equipment.GetSlotIds() -> integer[]`
-- `Engine.Equipment.GetSlotItem(equipmentSlot: integer) -> table|nil`
+- `Engine.Equipment.GetSlotItem(equipmentSlot: integer) -> EquipmentItem|nil`
 - `Engine.Equipment.GetSlotItemId(equipmentSlot: integer) -> integer|nil`
-- `Engine.Equipment.GetSnapshot() -> table`
+- `Engine.Equipment.GetSnapshot() -> InventorySnapshot`
 - `Engine.Equipment.HasItemInSlot(equipmentSlot: integer) -> boolean|nil`
 - `Engine.Equipment.LookSlotItem(itemId: integer, equipmentSlot: integer) -> boolean`
 - `Engine.Equipment.MoveFromContainerToSlot(containerIndex: integer, slotIndex: integer, itemId: integer, equipmentSlot: integer, itemCount: integer) -> boolean`
 - `Engine.Equipment.MoveFromSlotToContainer(equipmentSlot: integer, containerIndex: integer, slotIndex: integer, itemId: integer, itemCount: integer) -> boolean`
-- `Engine.EquipmentManager.GetEntries() -> table[]`
-- `Engine.EquipmentManager.GetProfiles() -> table[]`
+- `Engine.EquipmentManager.GetEntries() -> EquipmentManagerEntry[]`
+- `Engine.EquipmentManager.GetProfiles() -> EquipmentManagerProfile[]`
 - `Engine.EquipmentManager.SetActiveProfile(index: integer) -> boolean`
 - `Engine.EquipmentManager.SetConditionCreatureNames(entryIndex: integer, conditionIndex: integer, creatureNames: string) -> boolean`
 - `Engine.EquipmentManager.SetConditionCreaturesCount(entryIndex: integer, conditionIndex: integer, count: integer) -> boolean`
@@ -2323,62 +4192,62 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Extras.SetTrainingEnabled(value: boolean) -> boolean`
 - `Engine.Extras.StartTraining() -> boolean`
 - `Engine.Extras.StopTraining() -> boolean`
-- `Engine.Features.Disable(featureIdentifier: integer|string) -> nil`
-- `Engine.Features.DisableAllExcept(excludeList?: table) -> nil`
-- `Engine.Features.DisableMultiple(featureList: table) -> nil`
-- `Engine.Features.Enable(featureIdentifier: integer|string) -> nil`
-- `Engine.Features.EnableMultiple(featureList: table) -> nil`
+- `Engine.Features.Disable(featureIdentifier: integer|string) -> boolean`
+- `Engine.Features.DisableAllExcept(excludeList?: FeatureIdentifier[]) -> nil`
+- `Engine.Features.DisableMultiple(featureList: FeatureIdentifier[]) -> nil`
+- `Engine.Features.Enable(featureIdentifier: integer|string) -> boolean`
+- `Engine.Features.EnableMultiple(featureList: FeatureIdentifier[]) -> nil`
 - `Engine.Features.GetActiveFeatures() -> integer[]`
 - `Engine.Features.GetAllFeatureIds() -> integer[]`
 - `Engine.Features.GetName(featureIdentifier: integer|string) -> string`
 - `Engine.Features.IsActive(featureIdentifier: integer|string) -> boolean`
 - `Engine.Features.PrintStatus() -> nil`
-- `Engine.Features.SetActive(featureIdentifier: integer|string, activeStatus: boolean) -> nil`
-- `Engine.Features.Toggle(featureIdentifier: integer|string) -> nil`
-- `Engine.Healer.AddItem(itemData: table) -> number`
-- `Engine.Healer.AddSpell(spellData: table) -> number`
-- `Engine.Healer.ClearAllItems() -> nil`
-- `Engine.Healer.ClearAllSpells() -> nil`
+- `Engine.Features.SetActive(featureIdentifier: integer|string, activeStatus: boolean) -> boolean`
+- `Engine.Features.Toggle(featureIdentifier: integer|string) -> boolean`
+- `Engine.Healer.AddItem(itemData: HealerItemInput) -> integer|false`
+- `Engine.Healer.AddSpell(spellData: HealerSpellInput) -> integer|false`
+- `Engine.Healer.ClearAllItems() -> boolean`
+- `Engine.Healer.ClearAllSpells() -> boolean`
 - `Engine.Healer.DisableAllItems() -> nil`
 - `Engine.Healer.DisableAllSpells() -> nil`
-- `Engine.Healer.DisableItem(index: number) -> boolean`
-- `Engine.Healer.DisableSpell(index: number) -> boolean`
-- `Engine.Healer.EnableItem(index: number) -> boolean`
-- `Engine.Healer.EnableOnlyItems(itemIdsList: table) -> nil`
-- `Engine.Healer.EnableOnlySpells(spellWordsList: table) -> number`
-- `Engine.Healer.EnableSpell(index: number) -> boolean`
-- `Engine.Healer.FindItemById(itemId: number) -> table|nil`
-- `Engine.Healer.FindSpellByWords(spellWords: string) -> table|nil`
-- `Engine.Healer.GetItems() -> table`
-- `Engine.Healer.GetSpellByIndex(index: number) -> table|nil`
-- `Engine.Healer.GetSpells() -> table`
+- `Engine.Healer.DisableItem(index: integer) -> boolean`
+- `Engine.Healer.DisableSpell(index: integer) -> boolean`
+- `Engine.Healer.EnableItem(index: integer) -> boolean`
+- `Engine.Healer.EnableOnlyItems(itemIdsList: integer[]) -> nil`
+- `Engine.Healer.EnableOnlySpells(spellWordsList: string[]) -> integer`
+- `Engine.Healer.EnableSpell(index: integer) -> boolean`
+- `Engine.Healer.FindItemById(itemId: integer) -> HealerItemEntry|nil`
+- `Engine.Healer.FindSpellByWords(spellWords: string) -> IndexedHealerSpellEntry|nil`
+- `Engine.Healer.GetItems() -> HealerItemEntry[]`
+- `Engine.Healer.GetSpellByIndex(index: integer) -> HealerSpellEntry|nil`
+- `Engine.Healer.GetSpells() -> HealerSpellEntry[]`
 - `Engine.Healer.PrintItems() -> nil`
 - `Engine.Healer.PrintSpells() -> nil`
-- `Engine.Healer.RemoveItem(index: number) -> boolean`
-- `Engine.Healer.RemoveSpell(index: number) -> boolean`
+- `Engine.Healer.RemoveItem(index: integer) -> boolean`
+- `Engine.Healer.RemoveSpell(index: integer) -> boolean`
 - `Engine.Healer.SetItemAction(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemAttribute(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemCastValue(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemCondition(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemDelay(entryIndex: integer, value: integer) -> boolean`
-- `Engine.Healer.SetItemEnabled(index: any, enabled: any) -> boolean`
+- `Engine.Healer.SetItemEnabled(index: integer, enabled: boolean) -> boolean`
 - `Engine.Healer.SetItemId(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetItemUseWhenFeared(entryIndex: integer, value: boolean) -> boolean`
 - `Engine.Healer.SetSpellAttribute(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetSpellCastValue(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetSpellCondition(entryIndex: integer, value: integer) -> boolean`
-- `Engine.Healer.SetSpellEnabled(index: any, enabled: any) -> boolean`
+- `Engine.Healer.SetSpellEnabled(index: integer, enabled: boolean) -> boolean`
 - `Engine.Healer.SetSpellManaCost(entryIndex: integer, value: integer) -> boolean`
 - `Engine.Healer.SetSpellWords(entryIndex: integer, value: string) -> boolean`
-- `Engine.Healer.ToggleItem(index: number) -> boolean`
-- `Engine.Healer.ToggleSpell(index: number) -> boolean|nil`
-- `Engine.HealFriend.GetArea() -> table`
+- `Engine.Healer.ToggleItem(index: integer) -> boolean`
+- `Engine.Healer.ToggleSpell(index: integer) -> boolean|nil`
+- `Engine.HealFriend.GetArea() -> HealFriendArea`
 - `Engine.HealFriend.GetMode() -> integer`
 - `Engine.HealFriend.GetPlayerNames() -> string`
 - `Engine.HealFriend.GetPrioritizeBeforeHealer() -> integer`
 - `Engine.HealFriend.GetPriorityOverHealer() -> integer`
 - `Engine.HealFriend.GetSafeHealthPercentage() -> integer`
-- `Engine.HealFriend.GetVocations() -> table[]`
+- `Engine.HealFriend.GetVocations() -> HealFriendVocationEntry[]`
 - `Engine.HealFriend.SetActionEnabled(vocationIndex: integer, actionIndex: integer, enabled: boolean) -> boolean`
 - `Engine.HealFriend.SetActionHealthPercentage(vocationIndex: integer, actionIndex: integer, healthPercentage: integer) -> boolean`
 - `Engine.HealFriend.SetActionItemId(vocationIndex: integer, actionIndex: integer, itemId: integer) -> boolean`
@@ -2405,48 +4274,48 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.HealFriend.SetSafeHealthPercentage(value: boolean) -> boolean`
 - `Engine.HealFriend.SetVocationEnabled(vocationIndex: integer, enabled: boolean) -> boolean`
 - `Engine.HealFriend.SetVocationPriority(vocationIndex: integer, priority: integer) -> boolean`
-- `Engine.HUD.AddScreenImage(params: table) -> table`
-- `Engine.HUD.AddScreenText(params: table) -> table`
-- `Engine.HUD.AddWorldBox(params: table) -> table`
-- `Engine.HUD.AddWorldImage(params: table) -> table`
-- `Engine.HUD.AddWorldText(params: table) -> table`
+- `Engine.HUD.AddScreenImage(params: HudScreenImageParams) -> HudScreenImageParams`
+- `Engine.HUD.AddScreenText(params: HudScreenTextParams) -> HudScreenTextParams`
+- `Engine.HUD.AddWorldBox(params: HudWorldBoxParams) -> HudWorldBoxParams`
+- `Engine.HUD.AddWorldImage(params: HudWorldImageParams) -> HudWorldImageParams`
+- `Engine.HUD.AddWorldText(params: HudWorldTextParams) -> HudWorldTextParams`
 - `Engine.HUD.ClearParent(child_id: string) -> nil`
-- `Engine.HUD.GetConfig() -> table`
-- `Engine.HUD.GetElementColor(id: string) -> table|nil`
+- `Engine.HUD.GetConfig() -> HudFeatureConfig`
+- `Engine.HUD.GetElementColor(id: string) -> ColorRGBA`
 - `Engine.HUD.GetElementEnabled(id: string) -> boolean`
 - `Engine.HUD.GetElementHeight(id: string) -> number`
-- `Engine.HUD.GetElementText(id: string) -> string|nil`
+- `Engine.HUD.GetElementText(id: string) -> string`
 - `Engine.HUD.GetElementVisible(id: string) -> boolean`
 - `Engine.HUD.GetElementWidth(id: string) -> number`
-- `Engine.HUD.GetScreenElementPosition(id: string) -> table|nil`
-- `Engine.HUD.GetSpecialFoodCounters() -> table[]`
-- `Engine.HUD.GetWorldElementPosition(id: string) -> table|nil`
+- `Engine.HUD.GetScreenElementPosition(id: string) -> HudScreenPosition`
+- `Engine.HUD.GetSpecialFoodCounters() -> HudSpecialFoodCounter[]`
+- `Engine.HUD.GetWorldElementPosition(id: string) -> Position`
 - `Engine.HUD.RemoveElement(id: string) -> nil`
 - `Engine.HUD.RemoveSpecialFoodCounter(itemId: integer) -> boolean`
 - `Engine.HUD.SetAlignment(id: string, horizontal_align: integer, vertical_align: integer) -> nil`
-- `Engine.HUD.SetClickable(id: string, clickable: boolean, callback: function|nil) -> nil`
+- `Engine.HUD.SetClickable(id: string, clickable: boolean, callback: function()|nil) -> nil`
 - `Engine.HUD.SetDraggable(id: string, draggable: boolean) -> nil`
 - `Engine.HUD.SetDragTarget(id: string, targetId: string|nil) -> nil`
 - `Engine.HUD.SetEnabled(elementId: string, enabled: boolean) -> nil`
 - `Engine.HUD.SetLevelSpyEnabled(value: boolean) -> boolean`
 - `Engine.HUD.SetMagicWallIds(value: integer[]) -> boolean`
 - `Engine.HUD.SetMagicWallTimersEnabled(value: boolean) -> boolean`
-- `Engine.HUD.SetOnDragEnd(id: string, callback: function|nil) -> nil`
+- `Engine.HUD.SetOnDragEnd(id: string, callback: function(x: number, y: number)|nil) -> nil`
 - `Engine.HUD.SetParent(child_id: string, parent_id: string) -> nil`
-- `Engine.HUD.SetPosition(params: table) -> nil`
-- `Engine.HUD.SetScreenPosition(params: table) -> nil`
+- `Engine.HUD.SetPosition(params: HudWorldPositionUpdate) -> nil`
+- `Engine.HUD.SetScreenPosition(params: HudScreenPositionUpdate) -> nil`
 - `Engine.HUD.SetSpecialFoodCounterDelay(itemId: integer, delaySeconds: integer) -> boolean`
 - `Engine.HUD.SetTargetingAnchorEnabled(value: boolean) -> boolean`
 - `Engine.HUD.SetTimerColor(red: number, green: number, blue: number, alpha: number) -> boolean`
 - `Engine.HUD.SetWildGrowthIds(value: integer[]) -> boolean`
 - `Engine.HUD.SetXRayEnabled(value: boolean) -> boolean`
 - `Engine.HUD.SetZIndex(id: string, zIndex: integer) -> nil`
-- `Engine.HUD.UpdateBorderColor(id: string, color: table) -> nil`
+- `Engine.HUD.UpdateBorderColor(id: string, color: ColorRGBA) -> nil`
 - `Engine.HUD.UpdateBorderWidth(id: string, border_width: number) -> nil`
-- `Engine.HUD.UpdateColor(id: string, color: table) -> nil`
+- `Engine.HUD.UpdateColor(id: string, color: ColorRGBA) -> nil`
 - `Engine.HUD.UpdateFont(id: string, fontFamily: string|nil, fontSize: integer|nil) -> nil`
 - `Engine.HUD.UpdateHeight(id: string, height: number) -> nil`
-- `Engine.HUD.UpdateImageLabel(params: table) -> nil`
+- `Engine.HUD.UpdateImageLabel(params: HudImageLabelUpdate) -> nil`
 - `Engine.HUD.UpdateLifetime(id: string, lifetime_ms: integer) -> nil`
 - `Engine.HUD.UpdateOffset(id: string, offset_x: number, offset_y: number) -> nil`
 - `Engine.HUD.UpdateText(id: string, text: string) -> nil`
@@ -2458,59 +4327,59 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Looter.SetActionType(value: integer) -> boolean`
 - `Engine.Looter.SetMinimumCapacity(value: integer) -> boolean`
 - `Engine.Looter.SetMode(value: integer) -> boolean`
-- `Engine.Lure.AddSetting() -> any`
-- `Engine.Lure.ClearSettings() -> any`
-- `Engine.Lure.EndForceLure() -> any`
-- `Engine.Lure.GetAttackWhileLuring() -> any`
-- `Engine.Lure.GetConsiderOnlyReachable() -> any`
-- `Engine.Lure.GetIgnoringMonsters() -> any`
+- `Engine.Lure.AddSetting(setting: LureSettingInput) -> integer|false`
+- `Engine.Lure.ClearSettings() -> boolean`
+- `Engine.Lure.EndForceLure() -> boolean`
+- `Engine.Lure.GetAttackWhileLuring() -> boolean`
+- `Engine.Lure.GetConsiderOnlyReachable() -> boolean`
+- `Engine.Lure.GetIgnoringMonsters() -> boolean`
 - `Engine.Lure.GetKitingCloseMonsterCount() -> integer`
 - `Engine.Lure.GetKitingCloseMonsterDistance() -> integer`
 - `Engine.Lure.GetKitingMaximumFarthestDistance() -> integer`
 - `Engine.Lure.GetKitingPreferredFarthestDistance() -> integer`
-- `Engine.Lure.GetLuredCreaturesCount() -> any`
-- `Engine.Lure.GetNearRange() -> any`
-- `Engine.Lure.GetOption() -> any`
-- `Engine.Lure.GetSettingCount() -> any`
-- `Engine.Lure.GetSettings() -> any`
-- `Engine.Lure.GetSlowWalkBurstSteps() -> any`
-- `Engine.Lure.GetSlowWalkDelayMs() -> any`
-- `Engine.Lure.GetSlowWalkingCreaturesCount() -> any`
-- `Engine.Lure.GetStartEndLureActive() -> any`
-- `Engine.Lure.GetState() -> any`
-- `Engine.Lure.GetUnblocking() -> any`
-- `Engine.Lure.GetWaypointDynamicLureActive() -> any`
-- `Engine.Lure.HasActiveSettings() -> any`
-- `Engine.Lure.IsEnabled() -> any`
-- `Engine.Lure.IsFighting() -> any`
-- `Engine.Lure.IsForceLure() -> any`
-- `Engine.Lure.IsLuring() -> any`
-- `Engine.Lure.IsOtherPlayerOnScreen() -> any`
-- `Engine.Lure.RemoveSetting() -> any`
-- `Engine.Lure.SetAttackWhileLuring() -> any`
-- `Engine.Lure.SetConsiderOnlyReachable() -> any`
-- `Engine.Lure.SetEnabled() -> any`
-- `Engine.Lure.SetForceLure() -> any`
-- `Engine.Lure.SetIgnoringMonsters() -> any`
+- `Engine.Lure.GetLuredCreaturesCount() -> integer`
+- `Engine.Lure.GetNearRange() -> integer`
+- `Engine.Lure.GetOption() -> integer`
+- `Engine.Lure.GetSettingCount() -> integer`
+- `Engine.Lure.GetSettings() -> LureSetting[]`
+- `Engine.Lure.GetSlowWalkBurstSteps() -> integer`
+- `Engine.Lure.GetSlowWalkDelayMs() -> integer`
+- `Engine.Lure.GetSlowWalkingCreaturesCount() -> integer`
+- `Engine.Lure.GetStartEndLureActive() -> boolean`
+- `Engine.Lure.GetState() -> integer`
+- `Engine.Lure.GetUnblocking() -> boolean`
+- `Engine.Lure.GetWaypointDynamicLureActive() -> boolean`
+- `Engine.Lure.HasActiveSettings() -> boolean`
+- `Engine.Lure.IsEnabled() -> boolean`
+- `Engine.Lure.IsFighting() -> boolean`
+- `Engine.Lure.IsForceLure() -> boolean`
+- `Engine.Lure.IsLuring() -> boolean`
+- `Engine.Lure.IsOtherPlayerOnScreen() -> boolean`
+- `Engine.Lure.RemoveSetting(index: integer) -> boolean`
+- `Engine.Lure.SetAttackWhileLuring(enabled: boolean) -> boolean`
+- `Engine.Lure.SetConsiderOnlyReachable(enabled: boolean) -> boolean`
+- `Engine.Lure.SetEnabled(enabled: boolean) -> nil`
+- `Engine.Lure.SetForceLure(enabled: boolean) -> boolean`
+- `Engine.Lure.SetIgnoringMonsters(enabled: boolean) -> boolean`
 - `Engine.Lure.SetKitingCloseMonsterCount(count: integer) -> boolean`
 - `Engine.Lure.SetKitingCloseMonsterDistance(distance: integer) -> boolean`
 - `Engine.Lure.SetKitingMaximumFarthestDistance(distance: integer) -> boolean`
 - `Engine.Lure.SetKitingPreferredFarthestDistance(distance: integer) -> boolean`
-- `Engine.Lure.SetNearRange() -> any`
-- `Engine.Lure.SetOption() -> any`
-- `Engine.Lure.SetSlowWalkBurstSteps() -> any`
-- `Engine.Lure.SetSlowWalkDelayMs() -> any`
-- `Engine.Lure.SetSlowWalkingCreaturesCount() -> any`
-- `Engine.Lure.SetStartEndLureActive() -> any`
-- `Engine.Lure.SetUnblocking() -> any`
-- `Engine.Lure.SetWaypointDynamicLureActive() -> any`
-- `Engine.Lure.UpdateSetting() -> any`
-- `Engine.MagicShooter.GetActiveProfile() -> table|nil`
-- `Engine.MagicShooter.GetCurrentProfile() -> table|nil`
-- `Engine.MagicShooter.GetEntries(profile?: integer|string) -> table[]|nil, string|nil`
+- `Engine.Lure.SetNearRange(range: integer) -> boolean`
+- `Engine.Lure.SetOption(option: integer) -> boolean`
+- `Engine.Lure.SetSlowWalkBurstSteps(steps: integer) -> boolean`
+- `Engine.Lure.SetSlowWalkDelayMs(delayMs: integer) -> boolean`
+- `Engine.Lure.SetSlowWalkingCreaturesCount(count: integer) -> boolean`
+- `Engine.Lure.SetStartEndLureActive(enabled: boolean) -> boolean`
+- `Engine.Lure.SetUnblocking(enabled: boolean) -> boolean`
+- `Engine.Lure.SetWaypointDynamicLureActive(enabled: boolean) -> boolean`
+- `Engine.Lure.UpdateSetting(index: integer, updateData: LureSettingInput) -> boolean`
+- `Engine.MagicShooter.GetActiveProfile() -> ProfileSummary|nil`
+- `Engine.MagicShooter.GetCurrentProfile() -> ProfileSummary|nil`
+- `Engine.MagicShooter.GetEntries(profile?: integer|string) -> MagicShooterEntry[]|nil, string|nil`
 - `Engine.MagicShooter.GetProfileCount() -> integer`
 - `Engine.MagicShooter.GetProfileNames() -> string[]`
-- `Engine.MagicShooter.NextProfile() -> table|nil`
+- `Engine.MagicShooter.NextProfile() -> ProfileSummary|nil`
 - `Engine.MagicShooter.SetActiveProfile(profile: integer|string) -> boolean`
 - `Engine.MagicShooter.SetCurrentProfile(profile: integer|string) -> boolean`
 - `Engine.MagicShooter.SetEntryAttackSkillBuffSpell(entryIndex: integer, value: boolean, profile: integer|string|nil) -> boolean`
@@ -2559,7 +4428,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.MagicShooter.SetEntryStanceId(entryIndex: integer, value: string, profile: integer|string|nil) -> boolean`
 - `Engine.MagicShooter.SetEntryTargetPolicy(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
 - `Engine.MagicShooter.SetEntryTrackedEffect(entryIndex: integer, value: integer, profile: integer|string|nil) -> boolean`
-- `Engine.PVPTools.GetConfig() -> table`
+- `Engine.PVPTools.GetConfig() -> PVPConfig`
 - `Engine.PVPTools.IsAntiPushEnabled() -> boolean`
 - `Engine.PVPTools.IsHoldTargetEnabled() -> boolean`
 - `Engine.PVPTools.ResetLastTarget() -> boolean`
@@ -2586,9 +4455,9 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.PVPTools.ToggleAntiPush() -> boolean`
 - `Engine.PVPTools.ToggleHoldTarget() -> boolean`
 - `Engine.Scripter.GetAutoStartEnabled() -> boolean`
-- `Engine.Scripter.GetAvailableScripts() -> table[]`
+- `Engine.Scripter.GetAvailableScripts() -> string[]`
 - `Engine.Scripter.GetOutput(scriptName: string) -> string`
-- `Engine.Scripter.GetRunningScripts() -> table[]`
+- `Engine.Scripter.GetRunningScripts() -> string[]`
 - `Engine.Scripter.IsRunning(scriptName: string) -> boolean`
 - `Engine.Scripter.Refresh() -> boolean`
 - `Engine.Scripter.Restart(scriptName: string) -> boolean`
@@ -2596,9 +4465,11 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Scripter.Start(scriptName: string) -> boolean`
 - `Engine.Scripter.Stop(scriptName: string) -> boolean`
 - `Engine.Scripter.StopSelf() -> boolean`
+- `Engine.Settings.Load(path: string, features: SettingsFeatureSelection|nil) -> boolean, string`
+- `Engine.Settings.Save(path: string, features: SettingsFeatureSelection|nil) -> boolean, string`
 - `Engine.SuppliesSorter.AddEntry(destinationContainerId: integer, itemIds: integer[], enabled: boolean|nil) -> integer`
 - `Engine.SuppliesSorter.ClearEntries() -> boolean`
-- `Engine.SuppliesSorter.GetEntries() -> table[]`
+- `Engine.SuppliesSorter.GetEntries() -> SuppliesSorterEntry[]`
 - `Engine.SuppliesSorter.RemoveEntry(index: integer) -> boolean`
 - `Engine.SuppliesSorter.SetEntryDestinationContainerId(entryIndex: integer, value: integer) -> boolean`
 - `Engine.SuppliesSorter.SetEntryEnabled(entryIndex: integer, value: boolean) -> boolean`
@@ -2633,12 +4504,12 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.TankMode.SetManaShieldSpellWords(value: string) -> boolean`
 - `Engine.TankMode.SetPotionOnSpellCooldownEnabled(value: boolean) -> boolean`
 - `Engine.TankMode.SetPotionWhenFearedEnabled(value: boolean) -> boolean`
-- `Engine.Targeting.GetActiveProfile() -> table|nil`
-- `Engine.Targeting.GetCurrentProfile() -> table|nil`
-- `Engine.Targeting.GetEntries(profile: integer|string|nil) -> table[]|nil`
+- `Engine.Targeting.GetActiveProfile() -> ProfileSummary|nil`
+- `Engine.Targeting.GetCurrentProfile() -> ProfileSummary|nil`
+- `Engine.Targeting.GetEntries(profile: integer|string|nil) -> TargetingEntry[]|nil`
 - `Engine.Targeting.GetProfileCount() -> integer`
 - `Engine.Targeting.GetProfileNames() -> string[]`
-- `Engine.Targeting.NextProfile() -> table|nil`
+- `Engine.Targeting.NextProfile() -> ProfileSummary|nil`
 - `Engine.Targeting.SetActiveProfile(profile: integer|string) -> boolean`
 - `Engine.Targeting.SetCurrentProfile(profile: integer|string) -> boolean`
 - `Engine.Targeting.SetEntryAnchoring(entryIndex: integer, value: integer) -> boolean`
@@ -2659,7 +4530,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.Targeting.SetEntryStayDiagonal(entryIndex: integer, value: integer) -> boolean`
 - `Engine.TimerActions.AddEntry(type: integer, spellWords: string, itemId: integer, delay: integer, timeUnit: integer, useInProtectionZone: boolean, enabled: boolean|nil) -> integer`
 - `Engine.TimerActions.ClearEntries() -> boolean`
-- `Engine.TimerActions.GetEntries() -> table[]`
+- `Engine.TimerActions.GetEntries() -> TimerActionEntry[]`
 - `Engine.TimerActions.RemoveEntry(index: integer) -> boolean`
 - `Engine.TimerActions.SetEntryDelay(entryIndex: integer, delay: integer, timeUnit: integer) -> boolean`
 - `Engine.TimerActions.SetEntryEnabled(entryIndex: integer, value: boolean) -> boolean`
@@ -2667,109 +4538,111 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Engine.TimerActions.SetEntrySpellWords(entryIndex: integer, value: string) -> boolean`
 - `Engine.TimerActions.SetEntryType(entryIndex: integer, value: integer) -> boolean`
 - `Engine.TimerActions.SetEntryUseInProtectionZone(entryIndex: integer, value: boolean) -> boolean`
-- `Engine.Walker.AddSpecialArea(area: table) -> integer|string|false`
-- `Engine.Walker.AddWaypoint() -> any`
+- `Engine.Walker.AddAutoExploreConnector(connector: WalkerAutoExploreConnectorInput) -> integer|string|false`
+- `Engine.Walker.AddSpecialArea(area: WalkerSpecialAreaInput) -> integer|string|false`
+- `Engine.Walker.AddWaypoint(waypoint: RawWalkerWaypointInput) -> integer|false`
+- `Engine.Walker.ClearAutoExploreConnectors() -> boolean`
 - `Engine.Walker.ClearSpecialAreas() -> boolean`
-- `Engine.Walker.ClearWaypoints() -> any`
+- `Engine.Walker.ClearWaypoints() -> boolean`
 - `Engine.Walker.CompleteDeferred(token: integer) -> boolean`
 - `Engine.Walker.Defer(timeoutMs: integer) -> integer`
-- `Engine.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
-- `Engine.Walker.DeleteWaypoint() -> any`
-- `Engine.Walker.GetAutoRecorderEnabled() -> any`
-- `Engine.Walker.GetAutoRecorderOptions() -> any`
-- `Engine.Walker.GetAutoExploreConnectorRecording() -> boolean`
-- `Engine.Walker.GetAutoExploreConnectors() -> table[]`
-- `Engine.Walker.GetAutoExploreSettings() -> table`
-- `Engine.Walker.GetAutoExploreStatus() -> table`
-- `Engine.Walker.GetNavigationMode() -> string`
-- `Engine.Walker.GetDebugHud() -> any`
-- `Engine.Walker.GetDistanceBetweenWaypoints() -> any`
-- `Engine.Walker.GetLeaveLureOnPlayer() -> any`
-- `Engine.Walker.GetLeaveLurePlayerMode() -> integer`
-- `Engine.Walker.GetNodeDistance() -> any`
-- `Engine.Walker.GetSelectedWaypointIndex() -> any`
-- `Engine.Walker.GetSpecialAreaCount() -> integer`
-- `Engine.Walker.GetSpecialAreas() -> table[]`
-- `Engine.Walker.GetStartFromNearestWaypoint() -> any`
-- `Engine.Walker.GetWalkToLureCenter() -> any`
-- `Engine.Walker.GetWaypointCount() -> any`
-- `Engine.Walker.GetWaypoints() -> any`
-- `Engine.Walker.GoTo() -> any`
-- `Engine.Walker.InsertWaypoint() -> any`
-- `Engine.Walker.IsEnabled() -> any`
-- `Engine.Walker.IsPausedByLua() -> any`
-- `Engine.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
-- `Engine.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
-- `Engine.Walker.IsStuck() -> any`
-- `Engine.Walker.MoveWaypointDown() -> any`
-- `Engine.Walker.MoveWaypointUp() -> any`
-- `Engine.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
-- `Engine.Walker.ReplaceWaypoint() -> any`
-- `Engine.Walker.Resume() -> any`
-- `Engine.Walker.SelectClosestWaypoint() -> any`
-- `Engine.Walker.SetAutoRecorderEnabled() -> any`
-- `Engine.Walker.SetAutoRecorderOptions() -> any`
-- `Engine.Walker.AddAutoExploreConnector(connector: table) -> integer|string|false`
-- `Engine.Walker.ClearAutoExploreConnectors() -> boolean`
 - `Engine.Walker.DeleteAutoExploreConnector(id: integer|string) -> boolean`
+- `Engine.Walker.DeleteSpecialArea(id: integer|string) -> boolean`
+- `Engine.Walker.DeleteWaypoint(index: integer) -> boolean`
+- `Engine.Walker.GetAutoExploreConnectorRecording() -> boolean`
+- `Engine.Walker.GetAutoExploreConnectors() -> WalkerAutoExploreConnector[]`
+- `Engine.Walker.GetAutoExploreSettings() -> WalkerAutoExploreSettings`
+- `Engine.Walker.GetAutoExploreStatus() -> WalkerAutoExploreStatus`
+- `Engine.Walker.GetAutoRecorderEnabled() -> boolean`
+- `Engine.Walker.GetAutoRecorderOptions() -> WalkerAutoRecorderOptions`
+- `Engine.Walker.GetDebugHud() -> boolean`
+- `Engine.Walker.GetDistanceBetweenWaypoints() -> integer`
+- `Engine.Walker.GetLeaveLureOnPlayer() -> boolean`
+- `Engine.Walker.GetLeaveLurePlayerMode() -> integer`
+- `Engine.Walker.GetNavigationMode() -> WalkerNavigationMode`
+- `Engine.Walker.GetNodeDistance() -> integer`
+- `Engine.Walker.GetSelectedWaypointIndex() -> integer|nil`
+- `Engine.Walker.GetSpecialAreaCount() -> integer`
+- `Engine.Walker.GetSpecialAreas() -> WalkerSpecialArea[]`
+- `Engine.Walker.GetStartFromNearestWaypoint() -> boolean`
+- `Engine.Walker.GetWalkToLureCenter() -> boolean`
+- `Engine.Walker.GetWaypointCount() -> integer`
+- `Engine.Walker.GetWaypoints() -> WalkerWaypoint[]`
+- `Engine.Walker.GoTo(labelName: string) -> nil`
+- `Engine.Walker.InsertWaypoint(index: integer, waypoint: RawWalkerWaypointInput) -> boolean`
+- `Engine.Walker.IsAutoExplorePositionPainted(x: integer, y: integer, z: integer) -> boolean`
+- `Engine.Walker.IsEnabled() -> boolean`
+- `Engine.Walker.IsPausedByLua() -> boolean`
+- `Engine.Walker.IsPositionInsideSpecialArea(x: integer, y: integer, z: integer, featureMask: integer) -> boolean`
+- `Engine.Walker.IsStuck() -> boolean`
+- `Engine.Walker.MoveWaypointDown(index?: integer) -> boolean`
+- `Engine.Walker.MoveWaypointUp(index?: integer) -> boolean`
+- `Engine.Walker.ReorderSpecialArea(sourceIndex: integer, targetIndex: integer, dropAfterTarget?: boolean) -> boolean`
+- `Engine.Walker.ReplaceWaypoint(index: integer, waypoint: RawWalkerWaypointInput) -> boolean`
 - `Engine.Walker.ResetAutoExploreCoverage() -> boolean`
+- `Engine.Walker.Resume() -> nil`
+- `Engine.Walker.SelectClosestWaypoint() -> boolean`
 - `Engine.Walker.SetAutoExploreConnectorRecording(enabled: boolean) -> boolean`
-- `Engine.Walker.SetAutoExploreSettings(settings: table) -> boolean`
-- `Engine.Walker.SetNavigationMode(mode: string) -> boolean`
-- `Engine.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: table) -> boolean`
-- `Engine.Walker.SetDebugHud() -> any`
-- `Engine.Walker.SetDistanceBetweenWaypoints() -> any`
-- `Engine.Walker.SetEnabled() -> any`
-- `Engine.Walker.SetLeaveLureOnPlayer() -> any`
+- `Engine.Walker.SetAutoExploreSettings(settings: WalkerAutoExploreSettingsPatch) -> boolean`
+- `Engine.Walker.SetAutoRecorderEnabled(enabled: boolean) -> boolean`
+- `Engine.Walker.SetAutoRecorderOptions(options: WalkerAutoRecorderOptionsPatch) -> boolean`
+- `Engine.Walker.SetDebugHud(enabled: boolean) -> boolean`
+- `Engine.Walker.SetDistanceBetweenWaypoints(distance: integer) -> boolean`
+- `Engine.Walker.SetEnabled(enabled: boolean) -> nil`
+- `Engine.Walker.SetLeaveLureOnPlayer(enabled: boolean) -> boolean`
 - `Engine.Walker.SetLeaveLurePlayerMode(mode: integer) -> boolean`
-- `Engine.Walker.SetNodeDistance() -> any`
-- `Engine.Walker.SetPausedByLua() -> any`
-- `Engine.Walker.SetSelectedWaypointIndex() -> any`
-- `Engine.Walker.SetStartFromNearestWaypoint() -> any`
-- `Engine.Walker.SetWalkToLureCenter() -> any`
+- `Engine.Walker.SetNavigationMode(mode: string) -> boolean`
+- `Engine.Walker.SetNodeDistance(distance: integer) -> boolean`
+- `Engine.Walker.SetPausedByLua(paused: boolean) -> boolean`
+- `Engine.Walker.SetSelectedWaypointIndex(index: integer) -> boolean`
+- `Engine.Walker.SetStartFromNearestWaypoint(enabled: boolean) -> boolean`
+- `Engine.Walker.SetWalkToLureCenter(enabled: boolean) -> boolean`
 - `Engine.Walker.SetWaypointPosition(index: integer, x: integer, y: integer, z: integer) -> boolean`
-- `Engine.Walker.UpdateSpecialArea(id: integer|string, updateData: table) -> boolean`
+- `Engine.Walker.UpdateAutoExploreConnector(id: integer|string, updateData: WalkerAutoExploreConnectorPatch) -> boolean`
+- `Engine.Walker.UpdateSpecialArea(id: integer|string, updateData: WalkerSpecialAreaPatch) -> boolean`
+- `Settings.Load(path: string, features: SettingsFeatureSelection|nil) -> boolean, string`
+- `Settings.Save(path: string, features: SettingsFeatureSelection|nil) -> boolean, string`
 
 ### event_proxies.lua
 - `BattleMessageProxy:GetName() -> string`
-- `BattleMessageProxy:New(name: string) -> table`
-- `BattleMessageProxy:OnReceive(callback: function) -> table`
+- `BattleMessageProxy:New(name: string) -> BattleMessageProxy`
+- `BattleMessageProxy:OnReceive(callback: function(proxy: BattleMessageProxy, message: string)) -> BattleMessageProxy`
 - `ContainerAddItemProxy:GetName() -> string`
-- `ContainerAddItemProxy:New(name: string) -> table`
-- `ContainerAddItemProxy:OnReceive(callback: function) -> table`
+- `ContainerAddItemProxy:New(name: string) -> ContainerAddItemProxy`
+- `ContainerAddItemProxy:OnReceive(callback: function(proxy: ContainerAddItemProxy, containerIndex: nil, slot: nil, item: nil)) -> ContainerAddItemProxy`
 - `ContainerCloseProxy:GetName() -> string`
-- `ContainerCloseProxy:New(name: string) -> table`
-- `ContainerCloseProxy:OnReceive(callback: function) -> table`
+- `ContainerCloseProxy:New(name: string) -> ContainerCloseProxy`
+- `ContainerCloseProxy:OnReceive(callback: function(proxy: ContainerCloseProxy, containerIndex: nil)) -> ContainerCloseProxy`
 - `ContainerOpenProxy:GetName() -> string`
-- `ContainerOpenProxy:New(name: string) -> table`
-- `ContainerOpenProxy:OnReceive(callback: function) -> table`
+- `ContainerOpenProxy:New(name: string) -> ContainerOpenProxy`
+- `ContainerOpenProxy:OnReceive(callback: function(proxy: ContainerOpenProxy, containerIndex: nil, containerName: nil, containerID: nil)) -> ContainerOpenProxy`
 - `ContainerRemoveItemProxy:GetName() -> string`
-- `ContainerRemoveItemProxy:New(name: string) -> table`
-- `ContainerRemoveItemProxy:OnReceive(callback: function) -> table`
+- `ContainerRemoveItemProxy:New(name: string) -> ContainerRemoveItemProxy`
+- `ContainerRemoveItemProxy:OnReceive(callback: function(proxy: ContainerRemoveItemProxy, containerIndex: nil, slot: nil)) -> ContainerRemoveItemProxy`
 - `ContainerUpdateItemProxy:GetName() -> string`
-- `ContainerUpdateItemProxy:New(name: string) -> table`
-- `ContainerUpdateItemProxy:OnReceive(callback: function) -> table`
+- `ContainerUpdateItemProxy:New(name: string) -> ContainerUpdateItemProxy`
+- `ContainerUpdateItemProxy:OnReceive(callback: function(proxy: ContainerUpdateItemProxy, containerIndex: nil, slot: nil, item: nil)) -> ContainerUpdateItemProxy`
 - `CreatureAddProxy:GetName() -> string`
-- `CreatureAddProxy:New(name: string) -> table`
-- `CreatureAddProxy:OnReceive(callback: function) -> table`
+- `CreatureAddProxy:New(name: string) -> CreatureAddProxy`
+- `CreatureAddProxy:OnReceive(callback: function(proxy: CreatureAddProxy, creatureId: nil, creatureName: nil, position: nil)) -> CreatureAddProxy`
 - `CreatureRemoveProxy:GetName() -> string`
-- `CreatureRemoveProxy:New(name: string) -> table`
-- `CreatureRemoveProxy:OnReceive(callback: function) -> table`
+- `CreatureRemoveProxy:New(name: string) -> CreatureRemoveProxy`
+- `CreatureRemoveProxy:OnReceive(callback: function(proxy: CreatureRemoveProxy, creatureId: nil)) -> CreatureRemoveProxy`
 - `DeathProxy:GetName() -> string`
-- `DeathProxy:New(name: string) -> table`
-- `DeathProxy:OnReceive(callback: function) -> table`
+- `DeathProxy:New(name: string) -> DeathProxy`
+- `DeathProxy:OnReceive(callback: function(proxy: DeathProxy)) -> DeathProxy`
 - `GenericTextMessageProxy:GetName() -> string`
-- `GenericTextMessageProxy:New(name: string) -> table`
-- `GenericTextMessageProxy:OnReceive(callback: function) -> table`
+- `GenericTextMessageProxy:New(name: string) -> GenericTextMessageProxy`
+- `GenericTextMessageProxy:OnReceive(callback: function(proxy: GenericTextMessageProxy, message: string)) -> GenericTextMessageProxy`
 - `LootMessageProxy:GetName() -> string`
-- `LootMessageProxy:New(name: string) -> table`
-- `LootMessageProxy:OnReceive(callback: function) -> table`
+- `LootMessageProxy:New(name: string) -> LootMessageProxy`
+- `LootMessageProxy:OnReceive(callback: function(proxy: LootMessageProxy, message: string)) -> LootMessageProxy`
 - `SkillsChangeProxy:GetName() -> string`
-- `SkillsChangeProxy:New(name: string) -> table`
-- `SkillsChangeProxy:OnReceive(callback: function) -> table`
+- `SkillsChangeProxy:New(name: string) -> SkillsChangeProxy`
+- `SkillsChangeProxy:OnReceive(callback: function(proxy: SkillsChangeProxy, packet: IncomingOpcodeOnlyPacket)) -> SkillsChangeProxy`
 - `StatsChangeProxy:GetName() -> string`
-- `StatsChangeProxy:New(name: string) -> table`
-- `StatsChangeProxy:OnReceive(callback: function) -> table`
+- `StatsChangeProxy:New(name: string) -> StatsChangeProxy`
+- `StatsChangeProxy:OnReceive(callback: function(proxy: StatsChangeProxy, packet: IncomingOpcodeOnlyPacket)) -> StatsChangeProxy`
 
 ### features.lua
 - `BotFeatureId.ALARMS = 8`
@@ -2792,15 +4665,15 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `BotFeatureId.TIMER_ACTIONS = 18`
 - `BotFeatureId.WALKER = 5`
 - `Features.Disable(featureIdentifier: integer|string) -> boolean`
-- `Features.DisableAllExcept(ExcludeList)`
-- `Features.DisableMultiple(featureList)`
+- `Features.DisableAllExcept(ExcludeList: FeatureIdentifier[]) -> nil`
+- `Features.DisableMultiple(featureList: FeatureIdentifier[]) -> nil`
 - `Features.Enable(featureIdentifier: integer|string) -> boolean`
-- `Features.EnableMultiple(featureList)`
-- `Features.GetActiveFeatures()`
-- `Features.GetAllFeatureIds()`
-- `Features.GetName(featureIdentifier)`
-- `Features.IsActive(featureIdentifier)`
-- `Features.PrintStatus()`
+- `Features.EnableMultiple(featureList: FeatureIdentifier[]) -> nil`
+- `Features.GetActiveFeatures() -> integer[]`
+- `Features.GetAllFeatureIds() -> integer[]`
+- `Features.GetName(featureIdentifier: FeatureIdentifier) -> string`
+- `Features.IsActive(featureIdentifier: FeatureIdentifier) -> boolean`
+- `Features.PrintStatus() -> nil`
 - `Features.SetActive(featureIdentifier: integer|string, activeStatus: boolean) -> boolean`
 - `Features.Toggle(featureIdentifier: integer|string) -> boolean`
 
@@ -2811,197 +4684,197 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Game.LoginToCharacter(characterName: string) -> boolean`
 - `Game.LoginToPreviouslyLoggedCharacter() -> boolean`
 - `Game.Logout() -> boolean`
-- `Game.OpenContainerInNewWindow(equipmentSlotOrContainerId: number, fromContainerNumber: number|nil, fromContainerSlot: number|nil) -> boolean`
+- `Game.OpenContainerInNewWindow(equipmentSlotOrContainerId: integer, fromContainerNumber?: integer, fromContainerSlot?: integer) -> boolean`
 - `Game.OpenStore() -> boolean`
 
 ### hotkeys.lua
-- `Hotkeys.ParseCombo(combination: string) -> table|nil, string|nil`
-- `Hotkeys.RegisterCombo(params: table) -> boolean, string`
+- `Hotkeys.ParseCombo(combination: string) -> ParsedHotkey|nil, string|nil`
+- `Hotkeys.RegisterCombo(params: HotkeyRegistrationOptions) -> boolean, string`
 - `Hotkeys.SendCombo(combination: string, clientOnly?: boolean) -> boolean`
 - `Hotkeys.SendKey(key: string|integer, clientOnly?: boolean) -> boolean`
 
 ### http.lua
-- `Http.Get(url: string, options?: table) -> table`
-- `Http.GetJson(url: string, options?: table) -> any|nil, table, string|nil`
-- `Http.Post(url: string, body?: string, options?: table) -> table`
-- `Http.PostJson(url: string, value: any, options?: table) -> table`
-- `Http.Request(options: table) -> table`
+- `Http.Get(url: string, options?: HttpConvenienceOptions) -> HttpResponse`
+- `Http.GetJson(url: string, options?: HttpConvenienceOptions) -> JsonValue|nil, HttpResponse, string|nil`
+- `Http.Post(url: string, body?: string, options?: HttpConvenienceOptions) -> HttpResponse`
+- `Http.PostJson(url: string, value: JsonValue, options?: HttpConvenienceOptions) -> HttpResponse`
+- `Http.Request(options: HttpRequestOptions) -> HttpResponse`
 
 ### hud_wrapper.lua
 - `ScreenImage:ClearParent() -> ScreenImage`
-- `ScreenImage:Create()`
+- `ScreenImage:Create() -> ScreenImage`
 - `ScreenImage:GetEnabled() -> boolean`
 - `ScreenImage:GetHeight() -> number`
-- `ScreenImage:GetPosition() -> table`
+- `ScreenImage:GetPosition() -> HudScreenPosition`
 - `ScreenImage:GetVisible() -> boolean`
 - `ScreenImage:GetWidth() -> number`
 - `ScreenImage:IsCreated() -> boolean`
-- `ScreenImage:New(id, renderLayer?: string)`
-- `ScreenImage:Remove()`
-- `ScreenImage:SetAlignment(h_align, v_align)`
-- `ScreenImage:SetClickable(callback)`
-- `ScreenImage:SetDraggable(draggable)`
+- `ScreenImage:New(id: string, renderLayer?: string) -> ScreenImage`
+- `ScreenImage:Remove() -> nil`
+- `ScreenImage:SetAlignment(h_align: integer, v_align: integer) -> ScreenImage`
+- `ScreenImage:SetClickable(callback?: function()|false) -> ScreenImage`
+- `ScreenImage:SetDraggable(draggable: boolean) -> ScreenImage`
 - `ScreenImage:SetDragTarget(target: ScreenText|ScreenImage|string|nil) -> ScreenImage`
-- `ScreenImage:SetEnabled(enabled)`
-- `ScreenImage:SetItemId(itemId)`
-- `ScreenImage:SetItemName(itemName)`
-- `ScreenImage:SetLabel(text, color, offsetX, offsetY)`
-- `ScreenImage:SetOnDragEnd(callback: function|nil) -> ScreenImage`
+- `ScreenImage:SetEnabled(enabled: boolean) -> ScreenImage`
+- `ScreenImage:SetItemId(itemId: integer) -> ScreenImage`
+- `ScreenImage:SetItemName(itemName: string) -> ScreenImage`
+- `ScreenImage:SetLabel(text: string|nil, color?: ColorRGBA, offsetX?: number, offsetY?: number) -> ScreenImage`
+- `ScreenImage:SetOnDragEnd(callback?: function(x: number, y: number)|false) -> ScreenImage`
 - `ScreenImage:SetParent(parent: ScreenText|ScreenImage|string) -> ScreenImage`
 - `ScreenImage:SetRenderLayer(renderLayer: string) -> ScreenImage`
 - `ScreenImage:SetScreenPosition(x: number, y: number) -> ScreenImage`
-- `ScreenImage:SetSize(width, height)`
+- `ScreenImage:SetSize(width: number, height: number) -> ScreenImage`
 - `ScreenImage:SetSource(path: string) -> ScreenImage`
 - `ScreenImage:SetSourceBase64(base64Image: string) -> ScreenImage`
-- `ScreenImage:SetSourceBytes(imageBytes: number[]|string) -> ScreenImage`
-- `ScreenImage:SetZIndex(zIndex)`
+- `ScreenImage:SetSourceBytes(imageBytes: HudImageBytes) -> ScreenImage`
+- `ScreenImage:SetZIndex(zIndex: integer) -> ScreenImage`
 - `ScreenText:ClearParent() -> ScreenText`
 - `ScreenText:Create() -> ScreenText`
-- `ScreenText:GetColor() -> table`
+- `ScreenText:GetColor() -> ColorRGBA`
 - `ScreenText:GetEnabled() -> boolean`
 - `ScreenText:GetHeight() -> number`
-- `ScreenText:GetPosition() -> table`
+- `ScreenText:GetPosition() -> HudScreenPosition`
 - `ScreenText:GetText() -> string`
 - `ScreenText:GetVisible() -> boolean`
 - `ScreenText:GetWidth() -> number`
 - `ScreenText:IsCreated() -> boolean`
 - `ScreenText:New(id: string, renderLayer?: string) -> ScreenText`
-- `ScreenText:Remove()`
-- `ScreenText:SetAlignment(h_align: number, v_align: number) -> ScreenText`
-- `ScreenText:SetClickable(callback: function) -> ScreenText`
-- `ScreenText:SetColor(color: table) -> ScreenText`
+- `ScreenText:Remove() -> nil`
+- `ScreenText:SetAlignment(h_align: integer, v_align: integer) -> ScreenText`
+- `ScreenText:SetClickable(callback?: function()|false) -> ScreenText`
+- `ScreenText:SetColor(color: ColorRGBA) -> ScreenText`
 - `ScreenText:SetDraggable(draggable: boolean) -> ScreenText`
 - `ScreenText:SetDragTarget(target: ScreenText|ScreenImage|string|nil) -> ScreenText`
 - `ScreenText:SetEnabled(enabled: boolean) -> ScreenText`
 - `ScreenText:SetFont(family: string|nil, pixelSize: integer|nil) -> ScreenText`
 - `ScreenText:SetFontFamily(family: string|nil) -> ScreenText`
 - `ScreenText:SetFontSize(pixelSize: integer|nil) -> ScreenText`
-- `ScreenText:SetOnDragEnd(callback: function|nil) -> ScreenText`
+- `ScreenText:SetOnDragEnd(callback?: function(x: number, y: number)|false) -> ScreenText`
 - `ScreenText:SetParent(parent: ScreenText|ScreenImage|string) -> ScreenText`
 - `ScreenText:SetRenderLayer(renderLayer: string) -> ScreenText`
 - `ScreenText:SetScreenPosition(x: number, y: number) -> ScreenText`
 - `ScreenText:SetText(text: string) -> ScreenText`
-- `ScreenText:SetZIndex(zIndex: number) -> ScreenText`
+- `ScreenText:SetZIndex(zIndex: integer) -> ScreenText`
 - `WorldBox:ClearParent() -> WorldBox`
 - `WorldBox:Create() -> WorldBox`
-- `WorldBox:GetColor() -> table`
+- `WorldBox:GetColor() -> ColorRGBA`
 - `WorldBox:GetEnabled() -> boolean`
 - `WorldBox:GetHeight() -> number`
-- `WorldBox:GetPosition() -> table`
+- `WorldBox:GetPosition() -> Position`
 - `WorldBox:GetVisible() -> boolean`
 - `WorldBox:GetWidth() -> number`
 - `WorldBox:IsCreated() -> boolean`
-- `WorldBox:New(id: string, x: number, y: number, z: number, renderLayer?: string) -> WorldBox`
-- `WorldBox:Remove()`
-- `WorldBox:SetBorderColor(border_color: table) -> WorldBox`
+- `WorldBox:New(id: string, x: integer, y: integer, z: integer, renderLayer?: string) -> WorldBox`
+- `WorldBox:Remove() -> nil`
+- `WorldBox:SetBorderColor(border_color: ColorRGBA) -> WorldBox`
 - `WorldBox:SetBorderWidth(border_width: number) -> WorldBox`
-- `WorldBox:SetColor(color: table) -> WorldBox`
+- `WorldBox:SetColor(color: ColorRGBA) -> WorldBox`
 - `WorldBox:SetEnabled(enabled: boolean) -> WorldBox`
 - `WorldBox:SetHeight(height: number) -> WorldBox`
-- `WorldBox:SetLifetime(lifetime_ms: number) -> WorldBox`
+- `WorldBox:SetLifetime(lifetime_ms: integer) -> WorldBox`
 - `WorldBox:SetParent(parent_id: string) -> WorldBox`
-- `WorldBox:SetPosition(x: number, y: number, z: number) -> WorldBox`
+- `WorldBox:SetPosition(x: integer, y: integer, z: integer) -> WorldBox`
 - `WorldBox:SetRenderLayer(renderLayer: string) -> WorldBox`
 - `WorldBox:SetSize(width: number, height: number) -> WorldBox`
 - `WorldBox:SetWidth(width: number) -> WorldBox`
-- `WorldBox:SetZIndex(zIndex: number) -> WorldBox`
+- `WorldBox:SetZIndex(zIndex: integer) -> WorldBox`
 - `WorldImage:ClearParent() -> WorldImage`
-- `WorldImage:Create()`
+- `WorldImage:Create() -> WorldImage`
 - `WorldImage:GetEnabled() -> boolean`
 - `WorldImage:GetHeight() -> number`
-- `WorldImage:GetPosition() -> table`
+- `WorldImage:GetPosition() -> Position`
 - `WorldImage:GetVisible() -> boolean`
 - `WorldImage:GetWidth() -> number`
 - `WorldImage:IsCreated() -> boolean`
-- `WorldImage:New(id, x, y, z, renderLayer?: string)`
-- `WorldImage:Remove()`
+- `WorldImage:New(id: string, x: integer, y: integer, z: integer, renderLayer?: string) -> WorldImage`
+- `WorldImage:Remove() -> nil`
 - `WorldImage:SetEnabled(enabled: boolean) -> WorldImage`
-- `WorldImage:SetItemId(itemId)`
-- `WorldImage:SetItemName(itemName)`
-- `WorldImage:SetLabel(text: string|nil, color?: table, offsetX?: number, offsetY?: number) -> WorldImage`
-- `WorldImage:SetLifetime(lifetimeMs)`
-- `WorldImage:SetOffset(offsetX, offsetY)`
+- `WorldImage:SetItemId(itemId: integer) -> WorldImage`
+- `WorldImage:SetItemName(itemName: string) -> WorldImage`
+- `WorldImage:SetLabel(text: string|nil, color?: ColorRGBA, offsetX?: number, offsetY?: number) -> WorldImage`
+- `WorldImage:SetLifetime(lifetimeMs: integer) -> WorldImage`
+- `WorldImage:SetOffset(offsetX: number, offsetY: number) -> WorldImage`
 - `WorldImage:SetParent(parent_id: string) -> WorldImage`
-- `WorldImage:SetPosition(x, y, z)`
+- `WorldImage:SetPosition(x: integer, y: integer, z: integer) -> WorldImage`
 - `WorldImage:SetRenderLayer(renderLayer: string) -> WorldImage`
-- `WorldImage:SetSize(width, height)`
+- `WorldImage:SetSize(width: number, height: number) -> WorldImage`
 - `WorldImage:SetSource(path: string) -> WorldImage`
 - `WorldImage:SetSourceBase64(base64Image: string) -> WorldImage`
-- `WorldImage:SetSourceBytes(imageBytes: number[]|string) -> WorldImage`
-- `WorldImage:SetZIndex(zIndex)`
+- `WorldImage:SetSourceBytes(imageBytes: HudImageBytes) -> WorldImage`
+- `WorldImage:SetZIndex(zIndex: integer) -> WorldImage`
 - `WorldText:ClearParent() -> WorldText`
 - `WorldText:Create() -> WorldText`
-- `WorldText:GetColor() -> table`
+- `WorldText:GetColor() -> ColorRGBA`
 - `WorldText:GetEnabled() -> boolean`
 - `WorldText:GetHeight() -> number`
-- `WorldText:GetPosition() -> table`
+- `WorldText:GetPosition() -> Position`
 - `WorldText:GetText() -> string`
 - `WorldText:GetVisible() -> boolean`
 - `WorldText:GetWidth() -> number`
 - `WorldText:IsCreated() -> boolean`
-- `WorldText:New(id: string, x: number, y: number, z: number, renderLayer?: string) -> WorldText`
-- `WorldText:Remove()`
-- `WorldText:SetColor(color: table) -> WorldText`
+- `WorldText:New(id: string, x: integer, y: integer, z: integer, renderLayer?: string) -> WorldText`
+- `WorldText:Remove() -> nil`
+- `WorldText:SetColor(color: ColorRGBA) -> WorldText`
 - `WorldText:SetEnabled(enabled: boolean) -> WorldText`
 - `WorldText:SetFont(family: string|nil, pixelSize: integer|nil) -> WorldText`
 - `WorldText:SetFontFamily(family: string|nil) -> WorldText`
 - `WorldText:SetFontSize(pixelSize: integer|nil) -> WorldText`
-- `WorldText:SetLifetime(lifetime_ms: number) -> WorldText|WorldBox`
-- `WorldText:SetOffset(offset_x: number, offset_y: number) -> WorldText|WorldBox`
+- `WorldText:SetLifetime(lifetime_ms: integer) -> WorldText`
+- `WorldText:SetOffset(offset_x: number, offset_y: number) -> WorldText`
 - `WorldText:SetParent(parent_id: string) -> WorldText`
-- `WorldText:SetPosition(x: number, y: number, z: number) -> WorldText`
+- `WorldText:SetPosition(x: integer, y: integer, z: integer) -> WorldText`
 - `WorldText:SetRenderLayer(renderLayer: string) -> WorldText`
 - `WorldText:SetText(text: string) -> WorldText`
-- `WorldText:SetZIndex(zIndex: number) -> WorldText`
+- `WorldText:SetZIndex(zIndex: integer) -> WorldText`
 
 ### inventory.lua
 - `Inventory.CanMoveEquipment() -> boolean`
 - `Inventory.CanReadEquipment() -> boolean`
-- `Inventory.Equip(itemId: integer, tierLevel?: integer) -> any`
-- `Inventory.GetAllSlotItems() -> table`
-- `Inventory.GetEquipmentSlotConstants() -> table`
+- `Inventory.Equip(itemId: integer, tierLevel?: integer) -> boolean`
+- `Inventory.GetAllSlotItems() -> table<integer, EquipmentItem>`
+- `Inventory.GetEquipmentSlotConstants() -> EquipmentSlotConstants`
 - `Inventory.GetSlotIds() -> integer[]`
-- `Inventory.GetSlotItem(equipmentSlot: integer) -> table|nil`
+- `Inventory.GetSlotItem(equipmentSlot: integer) -> EquipmentItem|nil`
 - `Inventory.GetSlotItemId(equipmentSlot: integer) -> integer|nil`
-- `Inventory.GetSnapshot() -> table`
+- `Inventory.GetSnapshot() -> InventorySnapshot`
 - `Inventory.HasItemInSlot(equipmentSlot: integer) -> boolean|nil`
-- `Inventory.LookSlotItem(itemId: integer, equipmentSlot: integer) -> any`
-- `Inventory.MoveFromContainerToSlot(containerIndex: integer, slotIndex: integer, itemId: integer, equipmentSlot: integer, itemCount: integer) -> any`
-- `Inventory.MoveFromSlotToContainer(equipmentSlot: integer, containerIndex: integer, slotIndex: integer, itemId: integer, itemCount: integer) -> any`
+- `Inventory.LookSlotItem(itemId: integer, equipmentSlot: integer) -> boolean`
+- `Inventory.MoveFromContainerToSlot(containerIndex: integer, slotIndex: integer, itemId: integer, equipmentSlot: integer, itemCount: integer) -> boolean`
+- `Inventory.MoveFromSlotToContainer(equipmentSlot: integer, containerIndex: integer, slotIndex: integer, itemId: integer, itemCount: integer) -> boolean`
 
 ### item.lua
-- `Item.Buy(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> any`
-- `Item.FindInContainer(containerNumber: integer, itemId: integer, tierLevel?: integer) -> table|nil`
+- `Item.Buy(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> boolean`
+- `Item.FindInContainer(containerNumber: integer, itemId: integer, tierLevel?: integer) -> ContainerFindResult|nil`
 - `Item.GetDescription(itemId: integer) -> string|nil`
-- `Item.GetFromContainer(containerNumber: integer, slotIndex: integer) -> table|nil`
-- `Item.GetInfo(itemId: integer) -> table|nil`
+- `Item.GetFromContainer(containerNumber: integer, slotIndex: integer) -> ContainerItem|nil`
+- `Item.GetInfo(itemId: integer) -> ObjectInfo|nil`
 - `Item.GetName(itemId: integer) -> string|nil`
 - `Item.HasFlag(itemId: integer, fieldName: string) -> boolean`
-- `Item.IsContainer(itemId)`
-- `Item.IsCreature(itemId)`
-- `Item.IsCumulative(itemId)`
-- `Item.IsGround(itemId)`
-- `Item.IsLiquidContainer(itemId)`
-- `Item.IsMovable(itemId)`
-- `Item.IsMultiUsable(itemId)`
-- `Item.IsTakable(itemId)`
-- `Item.IsUsable(itemId)`
-- `Item.Sell(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> any`
+- `Item.IsContainer(itemId: integer) -> boolean`
+- `Item.IsCreature(itemId: integer) -> boolean`
+- `Item.IsCumulative(itemId: integer) -> boolean`
+- `Item.IsGround(itemId: integer) -> boolean`
+- `Item.IsLiquidContainer(itemId: integer) -> boolean`
+- `Item.IsMovable(itemId: integer) -> boolean`
+- `Item.IsMultiUsable(itemId: integer) -> boolean`
+- `Item.IsTakable(itemId: integer) -> boolean`
+- `Item.IsUsable(itemId: integer) -> boolean`
+- `Item.Sell(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> boolean`
 - `Item.Use(itemId: integer) -> boolean`
-- `Item.UseFromContainerOnFloor(floorPosition: table, fromItemId: integer, toItemId: integer, toStackPosition: integer) -> any`
-- `Item.UseFromContainerToContainer(fromContainer: integer, fromSlot: integer, fromItemId: integer, toContainer: integer, toSlot: integer, toItemId: integer) -> any`
-- `Item.UseFromFloorToContainer(floorPosition: table, fromItemId: integer, fromStackPosition: integer, toItemId: integer) -> any`
+- `Item.UseFromContainerOnFloor(floorPosition: PositionLike, fromItemId: integer, toItemId: integer, toStackPosition: integer) -> boolean`
+- `Item.UseFromContainerToContainer(fromContainer: integer, fromSlot: integer, fromItemId: integer, toContainer: integer, toSlot: integer, toItemId: integer) -> boolean`
+- `Item.UseFromFloorToContainer(floorPosition: PositionLike, fromItemId: integer, fromStackPosition: integer, toItemId: integer) -> boolean`
 - `Item.UseOnCreature(itemId: integer, creatureId: integer) -> boolean`
 - `Item.UseOnSelf(itemId: integer) -> boolean`
 
 ### json.lua
 - Constant: `Json.Null` (JSON null sentinel)
-- `Json.Array(value: table) -> table`
-- `Json.Decode(text: string) -> any`
-- `Json.Encode(value: any, pretty?: boolean|integer) -> string`
-- `Json.Object(value: table) -> table`
-- `Json.TryDecode(text: string) -> any|nil, string|nil`
-- `Json.TryEncode(value: any, pretty?: boolean|integer) -> string|nil, string|nil`
+- `Json.Array(value: JsonValue[]) -> JsonValue[]`
+- `Json.Decode(text: string) -> JsonValue`
+- `Json.Encode(value: JsonValue, pretty?: boolean|integer) -> string`
+- `Json.Object(value: table<string, JsonValue>) -> table<string, JsonValue>`
+- `Json.TryDecode(text: string) -> JsonValue|nil, string|nil`
+- `Json.TryEncode(value: JsonValue, pretty?: boolean|integer) -> string|nil, string|nil`
 
 ### lua_consts.lua
 - `CharacterFlag.BLEEDING = 15`
@@ -3247,34 +5120,34 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `WalkerEvent.ON_WAYPOINT_CHANGE = 1`
 
 ### map.lua
-- `Map.FindPath(fromPosition: table, toPosition: table, maxComplexity?: integer, flags?: integer) -> table`
-- `Map.GetObjectInfo(itemId: integer) -> table|nil`
-- `Map.GetTileFlags(position: table) -> table|nil`
-- `Map.GetTileItems(position: table, includeCreatures?: boolean) -> table[]`
-- `Map.Look(position: table) -> any`
-- `Map.MoveItemFloorToContainer(itemId: integer, fromPosition: table, containerIndex: integer, slotIndex: integer, itemCount: integer) -> any`
-- `Map.MoveItemFloorToFloor(fromPosition: table, itemId: integer, toPosition: table, itemCount: integer) -> any`
-- `Map.UseItemOnFloor(position: table, stackPosition: integer, itemId: integer) -> any`
+- `Map.FindPath(fromPosition: PositionLike, toPosition: PositionLike, maxComplexity?: integer, flags?: integer) -> MapPathResult`
+- `Map.GetObjectInfo(itemId: integer) -> ObjectInfo|nil`
+- `Map.GetTileFlags(position: PositionLike) -> MapTileFlags|nil`
+- `Map.GetTileItems(position: PositionLike, includeCreatures?: boolean) -> MapTileItem[]`
+- `Map.Look(position: PositionLike) -> boolean`
+- `Map.MoveItemFloorToContainer(itemId: integer, fromPosition: PositionLike, containerIndex: integer, slotIndex: integer, itemCount: integer) -> boolean`
+- `Map.MoveItemFloorToFloor(fromPosition: PositionLike, itemId: integer, toPosition: PositionLike, itemCount: integer) -> boolean`
+- `Map.UseItemOnFloor(position: PositionLike, stackPosition: integer, itemId: integer) -> boolean`
 
 ### minimap.lua
-- `Minimap.FindPath(fromPosition: table, toPosition: table, maxComplexity?: integer, flags?: integer) -> table`
-- `Minimap.GetTileFlags(position: table) -> table|nil`
-- `Minimap.GetTileInfo(position: table, includeCreatures?: boolean) -> table`
-- `Minimap.GetTileItems(position: table, includeCreatures?: boolean) -> table[]`
-- `Minimap.GetTilePixelColor(position: table) -> integer|nil`
-- `Minimap.IsPathable(position: table) -> boolean|nil`
+- `Minimap.FindPath(fromPosition: PositionLike, toPosition: PositionLike, maxComplexity?: integer, flags?: integer) -> MapPathResult`
+- `Minimap.GetTileFlags(position: PositionLike) -> MapTileFlags|nil`
+- `Minimap.GetTileInfo(position: PositionLike, includeCreatures?: boolean) -> MinimapTileInfo`
+- `Minimap.GetTileItems(position: PositionLike, includeCreatures?: boolean) -> MapTileItem[]`
+- `Minimap.GetTilePixelColor(position: PositionLike) -> integer|nil`
+- `Minimap.IsPathable(position: PositionLike) -> boolean|nil`
 - `Minimap.IsPixelColorWalkable(pixelColorIndex: integer) -> boolean`
-- `Minimap.IsWalkable(position: table) -> boolean|nil`
-- `Minimap.IsWalkableByColor(position: table) -> boolean|nil`
+- `Minimap.IsWalkable(position: PositionLike) -> boolean|nil`
+- `Minimap.IsWalkableByColor(position: PositionLike) -> boolean|nil`
 
 ### module.lua
-- `Module.After(name: string, callback: function, delayMs: integer) -> boolean`
+- `Module.After(name: string, callback: function(), delayMs: integer) -> boolean`
 - `Module.Cancel(name: string) -> boolean`
-- `Module.Every(name: string, callback: function, delayMs: integer) -> boolean`
+- `Module.Every(name: string, callback: function(), delayMs: integer) -> boolean`
 - `Module.Exists(name: string) -> boolean`
-- `Module.Get(name: string) -> table|nil`
-- `Module.List() -> table[]`
-- `Module.New(name: string, callback: function, delayMs?: integer) -> nil`
+- `Module.Get(name: string) -> ModuleRecord|nil`
+- `Module.List() -> ModuleListRecord[]`
+- `Module.New(name: string, callback: function(), delayMs?: integer) -> nil`
 - `Module.Pause(name: string) -> nil`
 - `Module.PauseManaged(name: string) -> boolean`
 - `Module.Resume(name: string) -> nil`
@@ -3282,22 +5155,22 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Module.Stop(name: string) -> nil`
 
 ### npc_trade_storage.lua
-- `NpcTradeStorage.Buy(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> any`
+- `NpcTradeStorage.Buy(itemId: integer, itemCount: integer, ignoreCapacity?: boolean, buyInShoppingBags?: boolean) -> boolean`
 - `NpcTradeStorage.FormatOffers() -> string[]`
 - `NpcTradeStorage.GetNpcName() -> string|nil`
-- `NpcTradeStorage.GetOfferByItemId(itemId: integer) -> table|nil`
-- `NpcTradeStorage.GetOfferByName(itemName: string) -> table|nil`
-- `NpcTradeStorage.GetOffers() -> table[]`
-- `NpcTradeStorage.GetSnapshot() -> table`
+- `NpcTradeStorage.GetOfferByItemId(itemId: integer) -> NpcTradeOffer|nil`
+- `NpcTradeStorage.GetOfferByName(itemName: string) -> NpcTradeOffer|nil`
+- `NpcTradeStorage.GetOffers() -> NpcTradeOffer[]`
+- `NpcTradeStorage.GetSnapshot() -> NpcTradeSnapshot`
 - `NpcTradeStorage.IsAvailable() -> boolean`
 - `NpcTradeStorage.IsOpen() -> boolean|nil`
-- `NpcTradeStorage.Sell(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> any`
+- `NpcTradeStorage.Sell(itemId: integer, itemCount: integer, sellEquipped?: boolean) -> boolean`
 
 ### position.lua
-- `Position.IsReachable(fromOrTarget: table|Position|nil, toOrFrom?: table) -> boolean`
-- `Position.IsShootable(fromOrTarget: table|Position|nil, toOrFrom?: table) -> boolean`
-- `Position.New(x: number|table, y?: number, z?: number) -> Position`
-- `Position:DistanceTo(otherPos: table|Position) -> integer`
+- `Position.IsReachable(fromOrTarget: PositionLike|nil, toOrFrom?: PositionLike) -> boolean`
+- `Position.IsShootable(fromOrTarget: PositionLike|nil, toOrFrom?: PositionLike) -> boolean`
+- `Position.New(x: integer|PositionLike, y?: integer, z?: integer) -> Position`
+- `Position:DistanceTo(otherPos: PositionLike) -> integer`
 
 ### self.lua
 - `Self.Attack(creatureId: integer) -> boolean`
@@ -3306,7 +5179,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.Dismount() -> boolean`
 - `Self.Equip(itemId: integer, tierLevel?: integer) -> boolean`
 - `Self.Follow(creatureId: integer) -> boolean`
-- `Self.FormatStatsSnapshot(stats?: table, prefix?: string) -> string`
+- `Self.FormatStatsSnapshot(stats?: SelfStatsSnapshot, prefix?: string) -> string`
 - `Self.GetCapacity() -> number|nil`
 - `Self.GetCapacityFloor() -> integer|nil`
 - `Self.GetCharacterWorld(characterName: string) -> string|nil`
@@ -3315,24 +5188,24 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.GetHealthPercentage() -> number|nil`
 - `Self.GetItemCount(itemId: integer, tierLevel?: integer) -> integer`
 - `Self.GetLevel() -> integer|nil`
-- `Self.GetLevelPercentage() -> number|nil`
+- `Self.GetLevelPercentage() -> integer|nil`
 - `Self.GetMana() -> integer|nil`
 - `Self.GetManaPercentage() -> number|nil`
 - `Self.GetManaShieldCapacity() -> integer|nil`
 - `Self.GetMaxHealth() -> integer|nil`
 - `Self.GetMaxMana() -> integer|nil`
 - `Self.GetMaxManaShieldCapacity() -> integer|nil`
-- `Self.GetMousePositionInWorld() -> table|nil`
+- `Self.GetMousePositionInWorld() -> Position|nil`
 - `Self.GetMousePositionText() -> string`
-- `Self.GetMouseWorldX() -> number|nil`
-- `Self.GetMouseWorldY() -> number|nil`
-- `Self.GetMouseWorldZ() -> number|nil`
+- `Self.GetMouseWorldX() -> integer|nil`
+- `Self.GetMouseWorldY() -> integer|nil`
+- `Self.GetMouseWorldZ() -> integer|nil`
 - `Self.GetSoul() -> integer|nil`
-- `Self.GetStamina() -> integer|nil`
+- `Self.GetStamina() -> number|nil`
 - `Self.GetStaminaDays() -> integer|nil`
 - `Self.GetStaminaHours() -> integer|nil`
-- `Self.GetStatsSnapshot() -> table`
-- `Self.GetStatusFlagsSnapshot() -> table`
+- `Self.GetStatsSnapshot() -> SelfStatsSnapshot`
+- `Self.GetStatusFlagsSnapshot() -> SelfStatusFlags`
 - `Self.GetTargetId() -> integer|nil`
 - `Self.HasFollow() -> boolean|nil`
 - `Self.HasTarget() -> boolean|nil`
@@ -3361,7 +5234,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.IsRooted() -> boolean|nil`
 - `Self.IsStrengthened() -> boolean|nil`
 - `Self.LookAtCreature(creatureId: integer) -> boolean`
-- `Self.LookAtPosition(position: table) -> boolean`
+- `Self.LookAtPosition(position: PositionLike) -> boolean`
 - `Self.Mount() -> boolean`
 - `Self.PrivateMessage(playerName: string, message: string) -> boolean`
 - `Self.Say(message: string) -> boolean`
@@ -3371,7 +5244,7 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `Self.Step(direction: integer) -> boolean`
 - `Self.StopAttackAndFollow() -> boolean`
 - `Self.UseItemInContainer(itemId: integer, containerIndex: integer, itemPos: integer, useItemWithHotkey?: boolean) -> boolean`
-- `Self.UseItemOnFloor(position: table, stackPosition: integer, itemId: integer) -> boolean`
+- `Self.UseItemOnFloor(position: PositionLike, stackPosition: integer, itemId: integer) -> boolean`
 - `Self.Whisper(message: string) -> boolean`
 - `Self.Yell(message: string) -> boolean`
 
@@ -3390,96 +5263,96 @@ Generated from `docs/Scripts/core`. It intentionally excludes local helpers, com
 - `BotSoundId.SKULL_ON_SCREEN = 8`
 - `BotSoundId.UNJUSTIFIED_KILL = 13`
 - `BotSoundId.WALKER_STUCK = 12`
-- `Sound.ClearQueue()`
+- `Sound.ClearQueue() -> nil`
 - `Sound.GetCurrentDuration() -> integer`
 - `Sound.GetFileDuration(filePath: string) -> integer`
-- `Sound.GetQueueLength() -> number`
+- `Sound.GetQueueLength() -> integer`
 - `Sound.GetQueueSize() -> integer`
 - `Sound.IsPlaying() -> boolean`
-- `Sound.IsQueued(options: table) -> boolean`
-- `Sound.Play(options: table)`
-- `Sound.PlayAndWait(options: table, maxWaitMs?: number) -> boolean`
-- `Sound.PlayBotSound(filename: string, instant?: boolean)`
-- `Sound.PlayById(soundId: number, instant?: boolean)`
-- `Sound.PlayByIdSmart(soundId: number, instant?: boolean) -> boolean`
-- `Sound.PlayByName(soundName: string, instant?: boolean)`
+- `Sound.IsQueued(options: SoundPlaybackOptions) -> boolean`
+- `Sound.Play(options: SoundPlaybackOptions) -> nil`
+- `Sound.PlayAndWait(options: SoundPlaybackOptions, maxWaitMs?: number) -> boolean`
+- `Sound.PlayBotSound(filename: string, instant?: boolean) -> nil`
+- `Sound.PlayById(soundId: integer, instant?: boolean) -> nil`
+- `Sound.PlayByIdSmart(soundId: integer, instant?: boolean) -> boolean`
+- `Sound.PlayByName(soundName: string, instant?: boolean) -> nil`
 - `Sound.PlayByNameSmart(soundName: string, instant?: boolean) -> boolean`
-- `Sound.PlayFile(filePath: string, instant?: boolean)`
+- `Sound.PlayFile(filePath: string, instant?: boolean) -> nil`
 - `Sound.PlayFileSmart(filePath: string, instant?: boolean) -> boolean`
-- `Sound.SetMinDelay(delayMs: integer)`
-- `Sound.Stop()`
-- `Sound.StopAll()`
+- `Sound.SetMinDelay(delayMs: integer) -> nil`
+- `Sound.Stop() -> nil`
+- `Sound.StopAll() -> nil`
 - `Sound.WaitForCompletion(maxWaitMs?: number) -> boolean`
 - `Time.MonotonicMs() -> integer`
 
 ### spells.lua
-- `Spells.GetGroupIds(spellOrWordsOrId)`
-- `Spells.GetIdByName(name)`
-- `Spells.GetIdByWords(words)`
-- `Spells.GetInfo(spellOrWordsOrId)`
-- `Spells.GetLeftCooldownTime(spellOrWordsOrId)`
-- `Spells.GetLeftGroupCooldownTime(groupId)`
-- `Spells.GetWordsById(spellId)`
-- `Spells.GroupIsInCooldown(groupId)`
-- `Spells.IsInCooldown(spellOrWordsOrId)`
-- `Spells.IsReady(spellOrWordsOrId)`
-- `Spells.IsUseWithItemExhausted()`
-- `Spells.Item.GetCooldownId(itemId)`
-- `Spells.Item.GetGroupIds(itemId)`
-- `Spells.Item.GetInfo(itemId)`
-- `Spells.Item.GetLeftCooldownTime(itemId)`
-- `Spells.Item.IsInCooldown(itemId)`
-- `Spells.Item.IsReady(itemId)`
-- `Spells.Item.WillBeReady(itemId, timeMs)`
-- `Spells.WillBeReady(spellOrWordsOrId, timeMs)`
+- `Spells.GetGroupIds(spellOrWordsOrId: string|integer) -> integer[]`
+- `Spells.GetIdByName(name: string) -> integer|nil`
+- `Spells.GetIdByWords(words: string) -> integer|nil`
+- `Spells.GetInfo(spellOrWordsOrId: string|integer) -> SpellInfo`
+- `Spells.GetLeftCooldownTime(spellOrWordsOrId: string|integer) -> integer`
+- `Spells.GetLeftGroupCooldownTime(groupId: integer) -> integer`
+- `Spells.GetWordsById(spellId: integer) -> string|nil`
+- `Spells.GroupIsInCooldown(groupId: integer) -> boolean`
+- `Spells.IsInCooldown(spellOrWordsOrId: string|integer) -> boolean`
+- `Spells.IsReady(spellOrWordsOrId: string|integer) -> boolean`
+- `Spells.IsUseWithItemExhausted() -> boolean`
+- `Spells.Item.GetCooldownId(itemId: integer) -> integer|nil`
+- `Spells.Item.GetGroupIds(itemId: integer) -> integer[]`
+- `Spells.Item.GetInfo(itemId: integer) -> ItemSpellInfo`
+- `Spells.Item.GetLeftCooldownTime(itemId: integer) -> integer`
+- `Spells.Item.IsInCooldown(itemId: integer) -> boolean`
+- `Spells.Item.IsReady(itemId: integer) -> boolean`
+- `Spells.Item.WillBeReady(itemId: integer, timeMs: integer) -> boolean`
+- `Spells.WillBeReady(spellOrWordsOrId: string|integer, timeMs: integer) -> boolean`
 
 ### storage.lua
 - `SharedStorageScope:Clear() -> boolean, string|nil`
-- `SharedStorageScope:Get(key: string, default?: any) -> any, string|nil`
+- `SharedStorageScope:Get(key: string, default?: JsonValue) -> JsonValue, string|nil`
 - `SharedStorageScope:OffChanged(subscriptionId: string) -> boolean, string|nil`
-- `SharedStorageScope:OnChanged(callback: function, key?: string, includeSelf?: boolean) -> string|nil, string|nil`
+- `SharedStorageScope:OnChanged(callback: function(event: SharedStorageChangeEvent), key?: string, includeSelf?: boolean) -> string|nil, string|nil`
 - `SharedStorageScope:Remove(key: string) -> boolean, string|nil`
-- `SharedStorageScope:Set(key: string, value: any) -> boolean, string|nil`
-- `SharedStorageScope:Update(key: string, updater: function, default?: any) -> boolean, any, string|nil`
+- `SharedStorageScope:Set(key: string, value: JsonValue) -> boolean, string|nil`
+- `SharedStorageScope:Update(key: string, updater: function(current: JsonValue) -> JsonValue, default?: JsonValue) -> boolean, JsonValue, string|nil`
 - `Storage.Character.Clear() -> boolean`
-- `Storage.Character.Get(key: string, default?: any) -> any`
+- `Storage.Character.Get(key: string, default?: JsonValue) -> JsonValue`
 - `Storage.Character.Remove(key: string) -> boolean`
-- `Storage.Character.Set(key: string, value: any) -> boolean`
+- `Storage.Character.Set(key: string, value: JsonValue) -> boolean`
 - `Storage.ForCharacter(namespace: string) -> StorageScope`
 - `Storage.Global.Clear() -> boolean`
-- `Storage.Global.Get(key: string, default?: any) -> any`
+- `Storage.Global.Get(key: string, default?: JsonValue) -> JsonValue`
 - `Storage.Global.Remove(key: string) -> boolean`
-- `Storage.Global.Set(key: string, value: any) -> boolean`
+- `Storage.Global.Set(key: string, value: JsonValue) -> boolean`
 - `Storage.Namespace(namespace: string, perCharacter?: boolean) -> StorageScope`
 - `Storage.Shared(namespace: string) -> SharedStorageScope`
 - `Storage.SharedForCharacter(namespace: string) -> SharedStorageScope`
-- `StorageScope:Get(key: string, default?: any) -> any`
+- `StorageScope:Get(key: string, default?: JsonValue) -> JsonValue`
 - `StorageScope:Remove(key: string) -> boolean`
-- `StorageScope:Set(key: string, value: any) -> boolean`
+- `StorageScope:Set(key: string, value: JsonValue) -> boolean`
 
 ### vip.lua
 - `VIP.Count() -> integer`
 - `VIP.CountOnline() -> integer`
 - `VIP.Exists(vipName: string) -> boolean`
-- `VIP.FindByPrefix(namePrefix: string, onlyOnline?: boolean) -> table[]`
-- `VIP.Get(vipName: string) -> table|nil`
-- `VIP.GetAll() -> table[]`
-- `VIP.GetByType(vipType: integer) -> table[]`
+- `VIP.FindByPrefix(namePrefix: string, onlyOnline?: boolean) -> VIPEntry[]`
+- `VIP.Get(vipName: string) -> VIPEntry|nil`
+- `VIP.GetAll() -> VIPEntry[]`
+- `VIP.GetByType(vipType: integer) -> VIPEntry[]`
 - `VIP.GetDescription(vipName: string) -> string|nil`
-- `VIP.GetHearts() -> table[]`
+- `VIP.GetHearts() -> VIPEntry[]`
 - `VIP.GetNames(onlyOnline?: boolean) -> string[]`
 - `VIP.GetNotifyOnLogin(vipName: string) -> boolean|nil`
-- `VIP.GetSnapshot() -> table`
+- `VIP.GetSnapshot() -> VIPSnapshot`
 - `VIP.GetType(vipName: string) -> integer|nil`
 - `VIP.IsAvailable() -> boolean`
 - `VIP.IsHeart(vipName: string) -> boolean`
 - `VIP.IsOnline(vipName: string) -> boolean`
-- `VIP.ToLookupTable() -> table`
+- `VIP.ToLookupTable() -> table<string, VIPEntry>`
 
 ### websocket.lua
-- `WebSocket.Connect(url: string, options?: table) -> table|nil, string|nil`
+- `WebSocket.Connect(url: string, options?: WebSocketConnectOptions) -> WebSocketConnection|nil, string|nil`
 - `WebSocketConnection:Close(closeCode?: integer, reason?: string) -> boolean, string|nil`
 - `WebSocketConnection:IsOpen() -> boolean`
-- `WebSocketConnection:Receive(timeoutMs?: integer) -> table`
+- `WebSocketConnection:Receive(timeoutMs?: integer) -> WebSocketEvent`
 - `WebSocketConnection:Send(data: string, binary?: boolean) -> boolean, string|nil`
 
